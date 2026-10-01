@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # La toolchain sale de rust-toolchain.toml (rustfmt + clippy incluidos)
+      - name: install toolchain
+        if: hashFiles('Cargo.toml') != ''
+        run: rustup show
+
+      # Se activa solo cuando exista Cargo.toml (esqueleto Rust llega post-S0)
+      - name: cargo fmt
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo clippy --all-targets -- -D warnings

@@ -1,0 +1,5 @@
+# Canal fijado desde el arranque para CI local/remoto reproducible.
+# La version exacta (ej. 1.8x.0) se fija en la tarea S0-P1-02.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
