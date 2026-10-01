@@ -1,0 +1,19 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock NO se ignora: es aplicacion, no libreria
+
+# Secretos y entornos locales — NUNCA commitear (repo publico)
+*.env
+!.env.example
+*.pem
+*.key
+*.crt
+
+# SO / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
