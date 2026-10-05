@@ -26,8 +26,14 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
 
 ## Escaneo de secretos (gitleaks, S0-P1-04)
 
-- **Local (primera capa):** instalar el hook de pre-commit **una vez** en este clone:
-  `gitleaks install` (el hook vive en `.git/hooks`, no se versiona).
+- **Local (primera capa):** instalar el hook de pre-commit **una vez** en este clone
+  (gitleaks no tiene comando `install`; el hook es un `.git/hooks/pre-commit` que
+  ejecuta `gitleaks git --staged`):
+
+  ```bash
+  printf '#!/usr/bin/env bash\nexec gitleaks git --staged --verbose\n' \
+    > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+  ```
 - **CI (segunda capa):** el job `gitleaks` (`.github/workflows/gitleaks.yml`)
   escanea el diff de cada PR y cada push a `main`.
 
