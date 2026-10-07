@@ -1,0 +1,16 @@
+[package]
+# Se nombra extraction-core (no "core") para no colisionar con la crate built-in `core`.
+name = "extraction-core"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+# El dominio NO importa librerias de infraestructura (SDD, S0-P3-01).
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
