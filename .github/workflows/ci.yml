@@ -13,14 +13,39 @@ jobs:
 
       # La toolchain sale de rust-toolchain.toml (rustfmt + clippy incluidos)
       - name: install toolchain
-        if: hashFiles('Cargo.toml') != ''
         run: rustup show
 
-      # Se activa solo cuando exista Cargo.toml (esqueleto Rust llega post-S0)
+      # Cache de dependencias (S0-P1-05)
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: cargo fmt
-        if: hashFiles('Cargo.toml') != ''
         run: cargo fmt --all -- --check
 
+      # S0-P3-02: clippy con warnings como error; unwrap/expect denegados
+      # via [workspace.lints.clippy] en Cargo.toml.
       - name: cargo clippy
-        if: hashFiles('Cargo.toml') != ''
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features
+
+      # CI falla ante dependencias con vulnerabilidad conocida
+      - name: cargo audit
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
+
+      # Licencias y duplicados de dependencias
+      - name: cargo deny
+        run: |
+          cargo install --locked cargo-deny
+          cargo deny check bans licenses advisories
