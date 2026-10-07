@@ -1,0 +1,17 @@
+[package]
+name = "extraction-worker"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+extraction-core = { path = "../core" }
+tokio.workspace = true
+actix-web.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+[lints]
+workspace = true
