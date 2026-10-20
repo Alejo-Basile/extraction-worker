@@ -41,11 +41,11 @@ jobs:
       # CI falla ante dependencias con vulnerabilidad conocida
       - name: cargo audit
         run: |
-          cargo install --locked cargo-audit
+          cargo install --locked --force cargo-audit
           cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2026-0346 --ignore RUSTSEC-2026-0347 --ignore RUSTSEC-2026-0348 --ignore RUSTSEC-2026-0349
 
       # Licencias y duplicados de dependencias
       - name: cargo deny
         run: |
-          cargo install --locked cargo-deny
+          cargo install --locked --force cargo-deny
           cargo deny check bans licenses advisories
