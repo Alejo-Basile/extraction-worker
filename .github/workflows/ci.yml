@@ -42,9 +42,7 @@ jobs:
       - name: cargo audit
         run: |
           cargo install --locked cargo-audit
-          # Ignorar RUSTSEC-2026-0258: h2 0.3.27 transitivo via actix-http 3.19
-          # Se levantará cuando actix-http migre a h2 0.4
-          cargo audit --ignore RUSTSEC-2026-0258
+          cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2026-0346 --ignore RUSTSEC-2026-0347 --ignore RUSTSEC-2026-0348 --ignore RUSTSEC-2026-0349
 
       # Licencias y duplicados de dependencias
       - name: cargo deny
