@@ -11,4 +11,5 @@
 pub mod config;
 pub mod dlq;
 pub mod group;
+pub mod resilience;
 pub mod runner;
