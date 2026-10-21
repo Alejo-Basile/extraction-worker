@@ -1,13 +1,9 @@
 //! Extraction Worker Service (Rust, Tokio + Actix-web).
 //!
-//! S0-P3-01: esqueleto con health y metricas. El consumer de Redis Streams,
-//! la extraccion real y la escritura en Mongo llegan en F1/F2.
-//!
-//! Endpoints (solo health y metricas, SDD 3.3):
-//! - `GET /healthz` — liveness: 200 si el proceso vive.
-//! - `GET /readyz` — trivial en S0; en F1 verifica Redis/MinIO reales.
-//! - `GET /metrics` — expositor Prometheus.
+//! S0-P3-01: esqueleto con health y metricas. F1 arranca el consumer
+//! de Redis Streams con apagado limpio (S1-P3-02/03).
 
+mod consumer;
 mod http;
 mod telemetry;
 
@@ -15,15 +11,17 @@ use std::env;
 
 use actix_web::{middleware, App, HttpServer};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
-/// Timeout de gracia del apagado (S0). En F1 el drenaje del consumer
-/// (`S1-P3-03`) acepta hasta 6 s por el `BLOCK 5000` del XREADGROUP.
+use consumer::{config::ConsumerConfig, runner::ConsumerRunner};
+
+/// Timeout de gracia del apagado. El consumer con `BLOCK 5000` debe
+/// cancelarse y salir en < 6s (S1-P3-03).
 const SHUTDOWN_GRACE_SECS: u64 = 30;
 
 const DEFAULT_HTTP_PORT: u16 = 8081;
 
-/// Lee el puerto HTTP. Config minimal en S0; la configuracion con fallo
-/// rapido y validacion completa llega en `S0-P3-04`.
+/// Lee el puerto HTTP.
 fn http_port() -> Result<u16, String> {
     match env::var("HTTP_PORT") {
         Ok(raw) => raw
@@ -51,13 +49,29 @@ async fn main() -> std::io::Result<()> {
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(SHUTDOWN_GRACE_SECS)
-    .disable_signals(); // senales manejadas manualmente abajo
+    .disable_signals(); // senales manejadas manualmente
 
     let running = server.run();
     let handle = running.handle();
 
+    // F1: arrancar consumer con CancellationToken (S1-P3-02/03)
+    let token = CancellationToken::new();
+    let token_consumer = token.clone();
+    let cfg = ConsumerConfig::from_env();
+    let runner = ConsumerRunner::new(cfg);
+    let consumer_handle = tokio::spawn(async move {
+        if let Err(e) = runner.run(token_consumer).await {
+            eprintln!("consumer finalizado con error: {e}");
+        }
+    });
+
     wait_for_shutdown_signal().await;
+    // Cancelar consumer primero para salir en < 6s (BLOCK 5000)
+    token.cancel();
+    // Parar HTTP
     handle.stop(true).await;
+    // Esperar consumer con timeout corto
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(6), consumer_handle).await;
 
     running.await?;
     Ok(())
