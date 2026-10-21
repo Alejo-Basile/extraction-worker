@@ -9,8 +9,11 @@
 //! - S2-P3-07: DLQ atomica (XADD + XACK en Lua) y conteo via XPENDING.
 
 pub mod classify;
+pub mod cli;
 pub mod config;
 pub mod dlq;
 pub mod group;
 pub mod resilience;
 pub mod runner;
+
+pub use cli::inspect_pel as cli_inspect_pel;

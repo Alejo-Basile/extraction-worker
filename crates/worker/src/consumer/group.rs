@@ -1,6 +1,9 @@
-use redis::{aio::MultiplexedConnection, RedisResult};
+//! Consumer group e inspeccion de la PEL (S1-P3-02/04).
+
+use redis::aio::MultiplexedConnection;
+use redis::streams::{StreamPendingCountReply, StreamPendingReply};
+use redis::AsyncCommands;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 use super::config::ConsumerConfig;
 
@@ -10,12 +13,20 @@ pub enum GroupError {
     Redis(#[from] redis::RedisError),
 }
 
+/// true si el error es `NOGROUP`: el stream o el grupo todavia no existen.
+/// Util para diagnosticos: inspeccionar una PEL vacia no debe fallar.
+pub fn is_nogroup(e: &GroupError) -> bool {
+    match e {
+        GroupError::Redis(r) => r.to_string().contains("NOGROUP"),
+    }
+}
+
+/// Crea el grupo con `XGROUP CREATE ... MKSTREAM` si no existe (S1-P3-02).
 pub async fn ensure_group(
     conn: &mut MultiplexedConnection,
     cfg: &ConsumerConfig,
 ) -> Result<(), GroupError> {
-    // S1-P3-02: XGROUP CREATE con MKSTREAM
-    let res: RedisResult<()> = redis::cmd("XGROUP")
+    let res: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(&cfg.stream)
         .arg(&cfg.group)
@@ -26,8 +37,8 @@ pub async fn ensure_group(
     match res {
         Ok(_) => Ok(()),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("BUSYGROUP") {
+            // BUSYGROUP: el grupo ya existe, es el camino feliz en reinicios.
+            if e.to_string().contains("BUSYGROUP") {
                 Ok(())
             } else {
                 Err(GroupError::Redis(e))
@@ -36,56 +47,78 @@ pub async fn ensure_group(
     }
 }
 
-/// S1-P3-04: Inspeccion de PEL
-/// XPENDING stream group [start end count [consumer]]
-#[allow(dead_code)]
+/// Resumen de la PEL: total pendiente y por consumidor (S1-P3-04).
 pub async fn pending_summary(
     conn: &mut MultiplexedConnection,
     cfg: &ConsumerConfig,
 ) -> Result<Value, GroupError> {
-    // XPENDING sin rango detallado -> resumen general
-    let res: redis::Value = redis::cmd("XPENDING")
-        .arg(&cfg.stream)
-        .arg(&cfg.group)
-        .query_async(conn)
-        .await?;
-    // Intentamos extraer info básica si viene como array
-    Ok(json!({"raw": format!("{:?}", res)}))
+    let reply: StreamPendingReply = conn.xpending(&cfg.stream, &cfg.group).await?;
+    Ok(match reply {
+        StreamPendingReply::Empty => json!({
+            "stream": cfg.stream,
+            "group": cfg.group,
+            "pending_count": 0,
+            "start_id": Value::Null,
+            "end_id": Value::Null,
+            "consumers": {},
+        }),
+        StreamPendingReply::Data(d) => {
+            let consumers: serde_json::Map<String, Value> = d
+                .consumers
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        json!({"pending": c.pending, "idle_ms": c.idle}),
+                    )
+                })
+                .collect();
+            json!({
+                "stream": cfg.stream,
+                "group": cfg.group,
+                "pending_count": d.count,
+                "start_id": d.start_id,
+                "end_id": d.end_id,
+                "consumers": consumers,
+            })
+        }
+        // El tipo es #[non_exhaustive]: variantes nuevas se tratan como vacio.
+        _ => json!({
+            "stream": cfg.stream,
+            "group": cfg.group,
+            "pending_count": 0,
+            "start_id": Value::Null,
+            "end_id": Value::Null,
+            "consumers": {},
+        }),
+    })
 }
 
-/// XPENDING con detalle por consumidor y antigüedad
-#[allow(dead_code)]
+/// Detalle de la PEL: entrada por mensaje con consumidor, antiguedad y
+/// delivery count (S1-P3-04). Muestra hasta 100 entradas.
 pub async fn pending_detailed(
     conn: &mut MultiplexedConnection,
     cfg: &ConsumerConfig,
 ) -> Result<Value, GroupError> {
-    // XPENDING stream group - + 100
-    let res: redis::Value = redis::cmd("XPENDING")
-        .arg(&cfg.stream)
-        .arg(&cfg.group)
-        .arg("-")
-        .arg("+")
-        .arg(100)
-        .query_async(conn)
+    let reply: StreamPendingCountReply = conn
+        .xpending_count(&cfg.stream, &cfg.group, "-", "+", 100)
         .await?;
-    let mut consumers: HashMap<String, i32> = HashMap::new();
-    if let redis::Value::Array(arr) = &res {
-        for item in arr.iter() {
-            if let redis::Value::Array(parts) = item {
-                if parts.len() >= 4 {
-                    if let redis::Value::BulkString(b) = &parts[3] {
-                        if let Ok(c) = String::from_utf8(b.clone()) {
-                            *consumers.entry(c).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let entries: Vec<Value> = reply
+        .ids
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "consumer": p.consumer,
+                "idle_ms": p.last_delivered_ms,
+                "delivery_count": p.times_delivered,
+            })
+        })
+        .collect();
     Ok(json!({
         "stream": cfg.stream,
         "group": cfg.group,
-        "count_sampled": consumers.values().sum::<i32>(),
-        "consumers": consumers
+        "count_sampled": entries.len(),
+        "entries": entries,
     }))
 }
