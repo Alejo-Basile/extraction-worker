@@ -3,13 +3,12 @@
 //! S0-P3-01: esqueleto con health y metricas. F1 arranca el consumer
 //! de Redis Streams con apagado limpio (S1-P3-02/03).
 
-mod consumer;
-mod http;
-mod telemetry;
-
 use std::env;
 
 use actix_web::{middleware, App, HttpServer};
+use extraction_worker::consumer;
+use extraction_worker::http;
+use extraction_worker::telemetry;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +33,10 @@ fn http_port() -> Result<u16, String> {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--inspect-pel") {
+        return extraction_worker::consumer::cli_inspect_pel().await;
+    }
     let port = http_port().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let prometheus = telemetry::prometheus_handle()
