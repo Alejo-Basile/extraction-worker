@@ -2,6 +2,7 @@ use std::env;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConsumerConfig {
     pub redis_url: String,
     pub stream: String,
