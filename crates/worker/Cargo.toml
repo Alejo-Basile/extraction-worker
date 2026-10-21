@@ -17,6 +17,7 @@ hostname.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 backoff.workspace = true
+time = { version = "0.3", features = ["formatting"] }
 
 [lints]
 workspace = true
