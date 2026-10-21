@@ -69,7 +69,7 @@ impl ConsumerRunner {
 
         let keys = vec![self.cfg.stream.clone()];
         let streams: redis::streams::StreamReadReply = conn
-            .xread_options(&keys, &vec![">".to_string()], &opts)
+            .xread_options(&keys, &[">".to_string()], &opts)
             .await?;
 
         if streams.keys.is_empty() {
