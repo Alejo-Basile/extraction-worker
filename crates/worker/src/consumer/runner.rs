@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use extraction_core::{ContractError, WorkItem};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use super::config::ConsumerConfig;
@@ -33,11 +34,20 @@ impl ConsumerRunner {
 
         group::ensure_group(&mut conn, &self.cfg).await?;
 
+        let mut autoclaim_ticker = interval(self.cfg.xautoclaim_interval);
+        autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
                     // S1-P3-03: apagado con cancelacion
                     break;
+                }
+                _ = autoclaim_ticker.tick() => {
+                    // S1-P3-05: reclamar huerfanos con min-idle-time > 2x job_timeout
+                    if let Err(e) = self.do_autoclaim(&mut conn).await {
+                        eprintln!("xautoclaim error: {e}");
+                    }
                 }
                 res = self.read_one(&mut conn) => {
                     match res {
@@ -54,6 +64,44 @@ impl ConsumerRunner {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn do_autoclaim(
+        &self,
+        conn: &mut MultiplexedConnection,
+    ) -> Result<(), RunnerError> {
+        // S1-P3-05: XAUTOCLAIM stream group consumer min-idle-time start [COUNT count]
+        let res: redis::Value = redis::cmd("XAUTOCLAIM")
+            .arg(&self.cfg.stream)
+            .arg(&self.cfg.group)
+            .arg(&self.cfg.consumer_name)
+            .arg(self.cfg.min_idle_ms)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(self.cfg.count)
+            .query_async(conn)
+            .await?;
+
+        // Logging minimo para diagnostico
+        if let redis::Value::Array(ref arr) = res {
+            if arr.is_empty() {
+                return Ok(());
+            }
+            // [next_start, claimed_messages[], deleted_ids[]] segun Redis
+            if arr.len() >= 2 {
+                if let redis::Value::Array(ref claimed) = arr[1] {
+                    if !claimed.is_empty() {
+                        eprintln!(
+                            "xautoclaim: {} mensajes reclamados (min_idle_ms={})",
+                            claimed.len(),
+                            self.cfg.min_idle_ms
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
