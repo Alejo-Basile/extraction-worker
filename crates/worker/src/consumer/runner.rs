@@ -6,6 +6,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use super::config::ConsumerConfig;
+use super::dlq;
 use super::group;
 
 #[derive(thiserror::Error, Debug)]
@@ -16,6 +17,8 @@ pub enum RunnerError {
     Redis(#[from] redis::RedisError),
     #[error("group: {0}")]
     Group(#[from] group::GroupError),
+    #[error("dlq: {0}")]
+    Dlq(#[from] dlq::DlqError),
 }
 
 pub struct ConsumerRunner {
@@ -52,8 +55,7 @@ impl ConsumerRunner {
                 res = self.read_one(&mut conn) => {
                     match res {
                         Ok(None) => continue,
-                        Ok(Some((id, item))) => {
-                            let _ = (id, item);
+                        Ok(Some((_id, _item))) => {
                             // procesamiento se implementara en F2/F3
                         }
                         Err(e) => {
@@ -127,18 +129,26 @@ impl ConsumerRunner {
         let map = &key.ids[0].map;
 
         // extraer campos
-        let mut fields = std::collections::HashMap::new();
+        let mut fields_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for (k, v) in map.iter() {
             if let redis::Value::BulkString(b) = v {
                 if let Ok(s) = String::from_utf8(b.clone()) {
-                    fields.insert(k.clone(), s);
+                    fields_map.insert(k.clone(), s);
                 }
             }
         }
 
+        // convertir a campos para DLQ
+        let fields_vec: Vec<(String, String)> = fields_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         // S1-P3-01: validar contrato
         let val = serde_json::Value::Object(
-            fields
+            fields_map
+                .clone()
                 .into_iter()
                 .map(|(k, v)| (k, serde_json::Value::String(v)))
                 .collect(),
@@ -146,15 +156,22 @@ impl ConsumerRunner {
         match serde_json::from_value::<WorkItem>(val) {
             Ok(item) => {
                 if let Err(ContractError::UnsupportedSchemaVersion(v)) = item.validate_schema() {
-                    eprintln!("schema_version no soportada: {v} -> DLQ (pendiente S2-P3-07)");
-                    // TODO: DLQ atomica
+                    eprintln!("schema_version no soportada: {v} -> moviendo a DLQ (atómico)");
+                    dlq::move_to_dlq_atomic(conn, &self.cfg, &id, &fields_vec).await?;
+                    return Ok(None);
+                }
+                // S2-P3-07: verificar intentos con delivery count
+                let attempts = dlq::get_delivery_count(conn, &self.cfg).await?;
+                if attempts >= (self.cfg.max_attempts as u64) {
+                    eprintln!("max_attempts alcanzado ({attempts}) -> moviendo a DLQ (atómico)");
+                    dlq::move_to_dlq_atomic(conn, &self.cfg, &id, &fields_vec).await?;
                     return Ok(None);
                 }
                 Ok(Some((id, item)))
             }
             Err(e) => {
-                eprintln!("mensaje invalido segun contrato -> DLQ (pendiente S2-P3-07): {e}");
-                // TODO: DLQ atomica con XADD+XACK
+                eprintln!("mensaje invalido segun contrato -> moviendo a DLQ (atómico): {e}");
+                dlq::move_to_dlq_atomic(conn, &self.cfg, &id, &fields_vec).await?;
                 Ok(None)
             }
         }
