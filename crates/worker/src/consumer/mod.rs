@@ -8,6 +8,7 @@
 //! - S1-P3-05: `XAUTOCLAIM` con `min-idle-time` > 2x `job_timeout`.
 //! - S2-P3-07: DLQ atomica (XADD + XACK en Lua) y conteo via XPENDING.
 
+pub mod classify;
 pub mod config;
 pub mod dlq;
 pub mod group;
