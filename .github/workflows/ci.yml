@@ -49,3 +49,39 @@ jobs:
         run: |
           cargo install --locked --force cargo-deny
           cargo deny check bans licenses advisories
+
+  integration:
+    # Tests de integracion contra Redis real (S1-P3-04, S2-P3-07):
+    # los #[ignore] corren solo aqui y en local (ver crates/worker/tests).
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install toolchain
+        run: rustup show
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo test ignored
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379/
+        run: cargo test --all-features -- --ignored
