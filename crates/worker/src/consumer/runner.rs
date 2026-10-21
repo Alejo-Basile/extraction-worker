@@ -3,13 +3,14 @@ use std::time::Duration;
 
 use extraction_core::{ContractError, WorkItem};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use super::classify::classify_redis_error;
 use super::config::ConsumerConfig;
 use super::dlq;
 use super::group;
-use super::resilience::{with_retry_cb, CircuitBreaker, ClassifiedError};
+use super::resilience::{with_retry_cb, CircuitBreaker, ClassifiedError, ErrorKind};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RunnerError {
@@ -22,6 +23,8 @@ pub enum RunnerError {
     #[error("dlq: {0}")]
     Dlq(#[from] dlq::DlqError),
 }
+
+const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ConsumerRunner {
     cfg: ConsumerConfig,
@@ -42,7 +45,20 @@ impl ConsumerRunner {
             .map_err(|e| RunnerError::Config(e.to_string()))?;
         // Retry+CB envuelve la conexión/lectura (composición correcta)
         let _ = with_retry_cb(&cb, || async { Ok::<(), ClassifiedError>(()) }).await;
-        let mut conn = client.get_multiplexed_async_connection().await?;
+        let conn_res = timeout(REDIS_OP_TIMEOUT, client.get_multiplexed_async_connection()).await;
+        let mut conn = match conn_res {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                let ce = classify_redis_error(&e);
+                if ce.kind == ErrorKind::Transient {
+                    return Err(RunnerError::Redis(e));
+                }
+                return Err(RunnerError::Redis(e));
+            }
+            Err(_) => {
+                return Err(RunnerError::Config("redis connect timeout".to_string()));
+            }
+        };
 
         group::ensure_group(&mut conn, &self.cfg).await?;
 
@@ -80,16 +96,29 @@ impl ConsumerRunner {
 
     async fn do_autoclaim(&self, conn: &mut MultiplexedConnection) -> Result<(), RunnerError> {
         // S1-P3-05: XAUTOCLAIM stream group consumer min-idle-time start [COUNT count]
-        let res: redis::Value = redis::cmd("XAUTOCLAIM")
-            .arg(&self.cfg.stream)
-            .arg(&self.cfg.group)
-            .arg(&self.cfg.consumer_name)
-            .arg(self.cfg.min_idle_ms)
-            .arg("0-0")
-            .arg("COUNT")
-            .arg(self.cfg.count)
-            .query_async(conn)
-            .await?;
+        let autoclaim_res = timeout(REDIS_OP_TIMEOUT, async {
+            redis::cmd("XAUTOCLAIM")
+                .arg(&self.cfg.stream)
+                .arg(&self.cfg.group)
+                .arg(&self.cfg.consumer_name)
+                .arg(self.cfg.min_idle_ms)
+                .arg("0-0")
+                .arg("COUNT")
+                .arg(self.cfg.count)
+                .query_async::<redis::Value>(conn)
+                .await
+        })
+        .await;
+        let res: redis::Value = match autoclaim_res {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                let _ = classify_redis_error(&e);
+                return Err(RunnerError::Redis(e));
+            }
+            Err(_) => {
+                return Err(RunnerError::Config("xautoclaim timeout".to_string()));
+            }
+        };
 
         // Logging minimo para diagnostico
         if let redis::Value::Array(ref arr) = res {
@@ -124,8 +153,21 @@ impl ConsumerRunner {
             .block(self.cfg.block_ms as usize);
 
         let keys = vec![self.cfg.stream.clone()];
-        let streams: redis::streams::StreamReadReply =
-            conn.xread_options(&keys, &[">".to_string()], &opts).await?;
+        let read_res = timeout(
+            Duration::from_millis(self.cfg.block_ms + 2000),
+            conn.xread_options(&keys, &[">".to_string()], &opts),
+        )
+        .await;
+        let streams: redis::streams::StreamReadReply = match read_res {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let _ = classify_redis_error(&e);
+                return Err(RunnerError::Redis(e));
+            }
+            Err(_) => {
+                return Err(RunnerError::Config("xreadgroup timeout".to_string()));
+            }
+        };
 
         if streams.keys.is_empty() {
             return Ok(None);
