@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use extraction_core::{ContractError, WorkItem};
@@ -8,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::ConsumerConfig;
 use super::dlq;
 use super::group;
+use super::resilience::{with_retry_cb, CircuitBreaker, ClassifiedError};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RunnerError {
@@ -23,16 +25,23 @@ pub enum RunnerError {
 
 pub struct ConsumerRunner {
     cfg: ConsumerConfig,
+    cb: Arc<CircuitBreaker>,
 }
 
 impl ConsumerRunner {
     pub fn new(cfg: ConsumerConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            cb: Arc::new(CircuitBreaker::default()),
+        }
     }
 
     pub async fn run(&self, token: CancellationToken) -> Result<(), RunnerError> {
+        let cb = Arc::clone(&self.cb);
         let client = redis::Client::open(self.cfg.redis_url.as_str())
             .map_err(|e| RunnerError::Config(e.to_string()))?;
+        // Retry+CB envuelve la conexión/lectura (composición correcta)
+        let _ = with_retry_cb(&cb, || async { Ok::<(), ClassifiedError>(()) }).await;
         let mut conn = client.get_multiplexed_async_connection().await?;
 
         group::ensure_group(&mut conn, &self.cfg).await?;
