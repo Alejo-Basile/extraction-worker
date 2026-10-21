@@ -67,10 +67,7 @@ impl ConsumerRunner {
         Ok(())
     }
 
-    async fn do_autoclaim(
-        &self,
-        conn: &mut MultiplexedConnection,
-    ) -> Result<(), RunnerError> {
+    async fn do_autoclaim(&self, conn: &mut MultiplexedConnection) -> Result<(), RunnerError> {
         // S1-P3-05: XAUTOCLAIM stream group consumer min-idle-time start [COUNT count]
         let res: redis::Value = redis::cmd("XAUTOCLAIM")
             .arg(&self.cfg.stream)
@@ -116,9 +113,8 @@ impl ConsumerRunner {
             .block(self.cfg.block_ms as usize);
 
         let keys = vec![self.cfg.stream.clone()];
-        let streams: redis::streams::StreamReadReply = conn
-            .xread_options(&keys, &[">".to_string()], &opts)
-            .await?;
+        let streams: redis::streams::StreamReadReply =
+            conn.xread_options(&keys, &[">".to_string()], &opts).await?;
 
         if streams.keys.is_empty() {
             return Ok(None);
