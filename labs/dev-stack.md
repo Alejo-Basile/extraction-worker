@@ -41,6 +41,13 @@ cargo test --all-features -- --ignored
 ## Notas
 
 - Credenciales de laboratorio, sin TLS ni ACL: **nunca** en produccion.
+- MinIO retiro sus imagenes y binarios publicos (Docker Hub, quay, dl.min.io
+  responden 410); el lab usa el build congelado `bitnamilegacy/minio`
+  (Ultima via publica disponible). Los buckets se crean con
+  `MINIO_DEFAULT_BUCKETS`; para inspeccionar:
+  `docker run --rm --network extraction-worker-dev_default
+  bitnamilegacy/minio-client:2025.7.21-debian-12-r3 /bin/bash -c
+  "mc alias set chk http://minio:9000 worker-dev worker-dev-secret && mc ls chk"`.
 - `.env` esta en `.gitignore` (`*.env`); solo se commitea `.env.example`.
 - Volumenes nombrados (`minio-data`, `mongo-data`): los datos sobreviven a
   `docker compose down` (sin `-v`). Para reiniciar de cero:
