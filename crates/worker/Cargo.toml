@@ -18,6 +18,8 @@ thiserror.workspace = true
 tokio-util.workspace = true
 backoff.workspace = true
 time = { version = "0.3", features = ["formatting"] }
+pdf-extract = "0.12.1"
+object_store = { version = "0.14.2", features = ["aws"] }
 
 [lints]
 workspace = true
