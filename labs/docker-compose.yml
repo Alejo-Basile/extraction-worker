@@ -1,0 +1,81 @@
+# Stack de desarrollo (F3a/F3b): MinIO + Mongo Replica Set.
+# NO usar en produccion: credenciales de laboratorio, sin TLS, sin ACL.
+#
+# Uso:
+#   cd labs && cp .env.example .env && docker compose up -d
+#   (el archivo .env esta en .gitignore: nunca se commitea)
+
+name: extraction-worker-dev
+
+services:
+  minio:
+    # RELEASE pinneada por reproducibilidad del lab.
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio-init:
+    # Crea los buckets del pipeline (seccion 11.4) y sale.
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c '
+      until mc alias set dev http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+        echo "esperando MinIO..." && sleep 2
+      done;
+      mc mb --ignore-existing dev/raw-pdfs;
+      mc mb --ignore-existing dev/extracted-txt;
+      mc anonymous set none dev/raw-pdfs;
+      mc anonymous set none dev/extracted-txt;
+      echo "buckets listos"
+      '
+
+  mongo:
+    # Replica Set rs0: requisito del Change Stream del relay (S1-P2-06) y
+    # del readConcern majority. Se prepara aqui para F3b (S2-P3-08/09).
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { 0 }"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_started
+    restart: "no"
+    entrypoint: >
+      bash -c '
+      for i in $$(seq 1 30); do
+        mongosh --host mongo --quiet --eval "rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"mongo:27017\"}]})" && echo "rs0 iniciado" && break;
+        sleep 2;
+      done
+      '
+
+volumes:
+  minio-data:
+  mongo-data:
