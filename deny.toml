@@ -4,7 +4,10 @@
 multiple-versions = "warn"
 
 [licenses]
-allow = ["MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "0BSD", "BSL-1.0", "CC0-1.0", "UPL-1.0", "Unlicense"]
+# CDLA-Permissive-2.0: licencia de datos (no de codigo) de webpki-root-certs
+# (raices TLS de Mozilla usadas por rustls via object_store/reqwest). Variante
+# permissive del CLA para datos: uso y redistribucion libres, sin copyleft.
+allow = ["MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "0BSD", "BSL-1.0", "CC0-1.0", "UPL-1.0", "Unlicense", "CDLA-Permissive-2.0"]
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
@@ -16,6 +19,9 @@ ignore = [
     "RUSTSEC-2026-0348",
     "RUSTSEC-2026-0349",
     "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0384",
     "RUSTSEC-2025-0012",
     "RUSTSEC-2024-0384",
+    # ttf-parser via lopdf (pdf-extract): unmaintained, sin vulnerabilidad conocida.
+    "RUSTSEC-2026-0192",
 ]
