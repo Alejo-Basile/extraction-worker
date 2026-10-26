@@ -51,8 +51,9 @@ jobs:
           cargo deny check bans licenses advisories
 
   integration:
-    # Tests de integracion contra Redis real (S1-P3-04, S2-P3-07):
-    # los #[ignore] corren solo aqui y en local (ver crates/worker/tests).
+    # Tests de integracion contra Redis y MinIO reales (S1-P3-04, S2-P3-01/07):
+    # los #[ignore] corren solo aqui y en local (ver crates/worker/tests y
+    # labs/dev-stack.md para el stack completo de desarrollo).
     runs-on: ubuntu-latest
     services:
       redis:
@@ -64,6 +65,21 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      minio:
+        # MinIO retiro sus imagenes oficiales upstream; bitnamilegacy es la
+        # ultima via publica (misma eleccion que labs/docker-compose.yml).
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+        env:
+          MINIO_ROOT_USER: worker-dev
+          MINIO_ROOT_PASSWORD: worker-dev-secret
+          MINIO_DEFAULT_BUCKETS: raw-pdfs,extracted-txt
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -84,4 +100,7 @@ jobs:
       - name: cargo test ignored
         env:
           REDIS_TEST_URL: redis://127.0.0.1:6379/
+          S3_ENDPOINT: http://127.0.0.1:9000
+          S3_ACCESS_KEY: worker-dev
+          S3_SECRET_KEY: worker-dev-secret
         run: cargo test --all-features -- --ignored
