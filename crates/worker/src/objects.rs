@@ -73,6 +73,19 @@ impl ObjectStoreSource {
     }
 }
 
+impl ObjectStoreSource {
+    /// Chequeo de alcance para `/readyz`: un `head` a una clave sonda.
+    /// `NotFound` significa servidor alcanzable y autorizado -> Ok.
+    pub async fn check(&self) -> Result<(), Failure> {
+        let probe = StorePath::from("extraction-worker-readyz-probe");
+        match ObjectStoreExt::head(&self.raw, &probe).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(classify_object_store_error(&e)),
+        }
+    }
+}
+
 impl crate::consumer::pipeline::ObjectSource for ObjectStoreSource {
     async fn download_to(
         &self,
@@ -99,6 +112,12 @@ impl ObjectStoreSink {
 impl crate::consumer::pipeline::TextSink for ObjectStoreSink {
     async fn put_text(&self, key: &str, text: &str) -> Result<(), Failure> {
         put_text(&self.txt, key, text).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Failure> {
+        ObjectStoreExt::delete(self.txt.as_ref(), &StorePath::from(key))
+            .await
+            .map_err(|e| classify_object_store_error(&e))
     }
 }
 
