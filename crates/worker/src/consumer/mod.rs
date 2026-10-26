@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod dlq;
 pub mod group;
+pub mod pipeline;
 pub mod resilience;
 pub mod runner;
 
