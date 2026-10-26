@@ -25,6 +25,14 @@ pub struct ConsumerConfig {
     pub s3_bucket_txt: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
+    /// Mongo con rol acotado a `update` sobre `documents` (ADR-0006).
+    pub mongo_uri: String,
+    pub mongo_db: String,
+    pub mongo_timeout: Duration,
+    /// Tope de paginas por documento (defensa ante PDF hostil, §11.5).
+    pub max_pages: u32,
+    /// Tope del texto extraido antes del PUT (§11.5).
+    pub max_output_bytes: u64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -81,6 +89,24 @@ impl ConsumerConfig {
             s3_bucket_txt: env_or("S3_BUCKET_TXT", "extracted-txt"),
             s3_access_key: env_or("S3_ACCESS_KEY", ""),
             s3_secret_key: env_or("S3_SECRET_KEY", ""),
+            mongo_uri: env_or(
+                "MONGO_WORKER_URI",
+                "mongodb://worker:worker-dev-secret@127.0.0.1:27017/app?authSource=app&directConnection=true",
+            ),
+            mongo_db: env_or("MONGO_DB", "app"),
+            mongo_timeout: Duration::from_millis(env_u64_or("MONGO_TIMEOUT_MS", 3000)),
+            max_pages: env_u64_or("WORKER_MAX_PAGES", 2000) as u32,
+            max_output_bytes: env_u64_or("WORKER_MAX_OUTPUT_BYTES", 52_428_800),
+        }
+    }
+}
+
+impl ConsumerConfig {
+    pub fn mongo_config(&self) -> crate::document_store::MongoConfig {
+        crate::document_store::MongoConfig {
+            uri: self.mongo_uri.clone(),
+            db: self.mongo_db.clone(),
+            timeout: self.mongo_timeout,
         }
     }
 }
