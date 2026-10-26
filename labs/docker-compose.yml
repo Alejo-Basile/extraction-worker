@@ -31,6 +31,18 @@ services:
       timeout: 3s
       retries: 12
 
+  redis:
+    # Streams del pipeline (sin password en el lab; en prod, ACL por
+    # usuario de aplicacion, S1-P1-07).
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   mongo:
     # Replica Set rs0: requisito del Change Stream del relay (S1-P2-06) y
     # del readConcern majority. Se prepara aqui para F3b (S2-P3-08/09).
