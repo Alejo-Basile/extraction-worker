@@ -61,7 +61,10 @@ async fn main() -> std::io::Result<()> {
     let token = CancellationToken::new();
     let token_consumer = token.clone();
     let cfg = ConsumerConfig::from_env();
-    let runner = ConsumerRunner::new(cfg);
+    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt)
+    let pipeline = extraction_worker::consumer::pipeline::ExtractionPipeline::from_env(&cfg)
+        .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
+    let runner = ConsumerRunner::new(cfg, std::sync::Arc::new(pipeline));
     let consumer_handle = tokio::spawn(async move {
         if let Err(e) = runner.run(token_consumer).await {
             eprintln!("consumer finalizado con error: {e}");

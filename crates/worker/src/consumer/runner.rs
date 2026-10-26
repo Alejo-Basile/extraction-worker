@@ -1,20 +1,27 @@
-//! Consumer loop (S1-P3-02/03/05, S2-P3-02/04/05/06/07).
+//! Consumer loop (S1-P3-02/03/05, S2-P3-01..08).
 //!
-//! Flujo F2 por mensaje entregado:
-//! 1. Validar contrato (`WorkItem::from_stream_fields`) y `schema_version`.
-//!    Contrato invalido o schema no soportada -> DLQ con causa (business).
-//! 2. Si el delivery count de `XPENDING` supera `WORKER_MAX_ATTEMPTS`
-//!    (comparacion `>` estricta: la entrega 1 es el primer intento real) ->
-//!    DLQ con `MAX_ATTEMPTS_EXCEEDED` (transient).
-//! 3. Mensaje valido: queda pendiente (sin ACK). En F3 el procesamiento
-//!    real hara el trabajo y el `XACK` al terminar.
+//! Flujo F3 por mensaje entregado (tarea con permiso del bulkhead):
+//! 1. Validar contrato y `schema_version` -> DLQ con causa (business).
+//! 2. Delivery count de `XPENDING` > `WORKER_MAX_ATTEMPTS` -> DLQ
+//!    `MAX_ATTEMPTS_EXCEEDED` (transient), sin re-extraer.
+//! 3. Pipeline: GET raw-pdfs -> archivo temporal -> extraccion -> PUT
+//!    extracted-txt. Exito -> `XACK`. `Failure::Document` -> DLQ (business).
+//!    Transient/Fatal/CircuitOpen -> el mensaje queda pendiente (se reclama
+//!    con `XAUTOCLAIM` y repite).
 //!
-//! Regla de ACK (S2-P3-07/08): el `XACK` solo ocurre dentro del script Lua
-//! de la DLQ o, en F3, tras procesar el mensaje. Nunca se hace ACK de un
-//! mensaje valido sin procesarlo.
+//! Regla de ACK (S2-P3-07/08): el `XACK` solo ocurre en el script Lua de la
+//! DLQ o cuando el pipeline completo el trabajo. Nunca antes.
 //!
-//! Composicion de resiliencia: `Retry` envuelve al `CircuitBreaker` y el
-//! breaker envuelve cada llamada individual con timeout (SDD 7.1-7.3).
+//! Bulkhead (S2-P3-03): `Semaphore(WORKER_MAX_CONCURRENCY)` acota las
+//! extracciones en vuelo por instancia; `/readyz` vive en el server HTTP y
+//! sigue respondiendo con todos los permisos tomados. Las tareas esperando
+//! permiso solo retienen el payload chico del mensaje (KBs), no el PDF.
+//!
+//! Apagado: el `JoinSet` se dropea y aborta las tareas en vuelo; los
+//! mensajes sin terminar quedan pendientes y otro worker los reclama.
+//!
+//! Composicion de resiliencia (SDD 7.1-7.3): `Retry` envuelve al
+//! `CircuitBreaker` de Redis y, dentro del pipeline, al breaker de MinIO.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -27,6 +34,8 @@ use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +43,7 @@ use super::classify::classify_redis_error;
 use super::config::ConsumerConfig;
 use super::dlq::{self, best_effort_item, contract_cause};
 use super::group;
+use super::pipeline::{ExtractionPipeline, ObjectSource, TextSink};
 use super::resilience::{with_retry_cb, CircuitBreaker, Failure};
 
 #[derive(thiserror::Error, Debug)]
@@ -55,53 +65,73 @@ pub enum RunnerError {
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
 const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
 
-/// Resultado de procesar un mensaje entregado.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageOutcome {
-    /// Contrato valido: en F2 queda pendiente en la PEL hasta que F3
-    /// implemente el procesamiento y el ACK.
-    NeedsProcessing,
-    /// Derivado a la DLQ con su causa (atomico, con ACK).
-    SentToDlq,
+/// Contexto clonable que lleva cada tarea de procesamiento. La conexion se
+/// pasa por parametro: se establece una vez en `run()`. `Clone` es manual:
+/// los adaptadores `S`/`K` no son clonables, pero viajan en `Arc`.
+pub struct JobContext<S: ObjectSource, K: TextSink> {
+    pub cfg: ConsumerConfig,
+    pub pipeline: Arc<ExtractionPipeline<S, K>>,
+    pub redis_breaker: Arc<CircuitBreaker>,
 }
 
-pub struct ConsumerRunner {
-    cfg: ConsumerConfig,
-    cb: Arc<CircuitBreaker>,
-}
-
-impl ConsumerRunner {
-    pub fn new(cfg: ConsumerConfig) -> Self {
+impl<S: ObjectSource, K: TextSink> Clone for JobContext<S, K> {
+    fn clone(&self) -> Self {
         Self {
-            cfg,
-            cb: Arc::new(CircuitBreaker::default()),
+            cfg: self.cfg.clone(),
+            pipeline: self.pipeline.clone(),
+            redis_breaker: self.redis_breaker.clone(),
+        }
+    }
+}
+
+pub struct ConsumerRunner<S: ObjectSource, K: TextSink> {
+    ctx: JobContext<S, K>,
+    /// Bulkhead de extracciones en vuelo (S2-P3-03).
+    sem: Arc<Semaphore>,
+}
+
+impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
+    pub fn new(cfg: ConsumerConfig, pipeline: Arc<ExtractionPipeline<S, K>>) -> Self {
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrency));
+        Self {
+            ctx: JobContext {
+                cfg,
+                pipeline,
+                redis_breaker: Arc::new(CircuitBreaker::default()),
+            },
+            sem,
         }
     }
 
     pub async fn run(&self, token: CancellationToken) -> Result<(), RunnerError> {
-        let client = redis::Client::open(self.cfg.redis_url.as_str())
+        let ctx = &self.ctx;
+        let client = redis::Client::open(ctx.cfg.redis_url.as_str())
             .map_err(|e| RunnerError::Config(e.to_string()))?;
-        let mut conn = self.connect(&client).await?;
-        group::ensure_group(&mut conn, &self.cfg).await?;
+        let mut conn = Self::connect(ctx, &client).await?;
+        group::ensure_group(&mut conn, &ctx.cfg).await?;
 
-        let mut autoclaim_ticker = interval(self.cfg.xautoclaim_interval);
+        let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
         autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut autoclaim_cursor = "0-0".to_string();
+        // JoinSet: al drop-ear (apagado) aborta las tareas en vuelo; los
+        // mensajes sin terminar quedan pendientes y otro worker los reclama.
+        let mut jobs: JoinSet<()> = JoinSet::new();
 
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = autoclaim_ticker.tick() => {
-                    if let Err(e) = self.do_autoclaim(&conn, &mut autoclaim_cursor).await {
+                    if let Err(e) = Self::do_autoclaim(ctx, &conn, &mut autoclaim_cursor, &self.sem, &mut jobs).await {
                         eprintln!("xautoclaim error: {e}");
                     }
                 }
-                res = self.read_and_process(&conn) => {
+                res = Self::read_batch(ctx, &conn) => {
                     match res {
-                        Ok(Some(MessageOutcome::NeedsProcessing)) => {
-                            eprintln!("mensaje valido, pendiente de procesamiento (F3)");
+                        Ok(batch) => {
+                            for (id, fields) in batch {
+                                Self::spawn_job(ctx, &self.sem, &conn, &mut jobs, id, fields);
+                            }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             eprintln!("consumer error: {e}");
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -110,13 +140,17 @@ impl ConsumerRunner {
                 }
             }
         }
+        drop(jobs);
         Ok(())
     }
 
-    /// Conexion inicial con Retry+CB: corta cuando el breaker lo decide o se
-    /// agota el tiempo maximo de reintento.
-    async fn connect(&self, client: &redis::Client) -> Result<MultiplexedConnection, RunnerError> {
-        with_retry_cb(&self.cb, || async {
+    /// Conexion inicial con Retry+CB de Redis: corta cuando el breaker lo
+    /// decide o se agota el tiempo maximo de reintento.
+    async fn connect(
+        ctx: &JobContext<S, K>,
+        client: &redis::Client,
+    ) -> Result<MultiplexedConnection, RunnerError> {
+        with_retry_cb(&ctx.redis_breaker, || async {
             match timeout(REDIS_OP_TIMEOUT, client.get_multiplexed_async_connection()).await {
                 Ok(Ok(c)) => Ok(c),
                 Ok(Err(e)) => Err(classify_redis_error(&e)),
@@ -130,10 +164,10 @@ impl ConsumerRunner {
         .map_err(RunnerError::from)
     }
 
-    /// Corre `op` con Retry+CB sobre un clon del pool de conexion
+    /// Corre `op` con Retry+CB de Redis sobre un clon del pool de conexion
     /// (`MultiplexedConnection: Clone`; los clones comparten el mismo socket).
     async fn retry_redis<T, F, Fut>(
-        &self,
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         op: F,
     ) -> Result<T, Failure>
@@ -141,147 +175,235 @@ impl ConsumerRunner {
         F: Fn(MultiplexedConnection) -> Fut,
         Fut: Future<Output = Result<T, Failure>>,
     {
-        with_retry_cb(&self.cb, || op(conn.clone())).await
+        with_retry_cb(&ctx.redis_breaker, || op(conn.clone())).await
     }
 
-    async fn read_and_process(
-        &self,
+    async fn read_batch(
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
-    ) -> Result<Option<MessageOutcome>, RunnerError> {
-        let cfg = &self.cfg;
-        let streams: StreamReadReply = self
-            .retry_redis(conn, |mut c| async move {
-                let opts = StreamReadOptions::default()
-                    .group(&cfg.group, &cfg.consumer_name)
-                    .count(cfg.count)
-                    .block(cfg.block_ms as usize);
-                let keys = vec![cfg.stream.clone()];
-                match timeout(
-                    Duration::from_millis(cfg.block_ms + 2000),
-                    c.xread_options(&keys, &[">".to_string()], &opts),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => Ok(s),
-                    Ok(Err(e)) => Err(classify_redis_error(&e)),
-                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xreadgroup timeout")),
-                }
-            })
-            .await?;
+    ) -> Result<Vec<(String, HashMap<String, String>)>, RunnerError> {
+        let cfg = &ctx.cfg;
+        let streams: StreamReadReply = Self::retry_redis(ctx, conn, |mut c| async move {
+            let opts = StreamReadOptions::default()
+                .group(&cfg.group, &cfg.consumer_name)
+                .count(cfg.count)
+                .block(cfg.block_ms as usize);
+            let keys = vec![cfg.stream.clone()];
+            match timeout(
+                Duration::from_millis(cfg.block_ms + 2000),
+                c.xread_options(&keys, &[">".to_string()], &opts),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(classify_redis_error(&e)),
+                Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xreadgroup timeout")),
+            }
+        })
+        .await?;
 
-        let Some(entry) = streams.keys.into_iter().next() else {
-            return Ok(None);
-        };
-        let Some(first) = entry.ids.into_iter().next() else {
-            return Ok(None);
-        };
-        let id = first.id.clone();
-        let fields: HashMap<String, String> = first
-            .map
-            .iter()
-            .filter_map(|(k, v)| match v {
-                redis::Value::BulkString(b) => {
-                    String::from_utf8(b.clone()).ok().map(|s| (k.clone(), s))
-                }
-                _ => None,
+        Ok(streams
+            .keys
+            .into_iter()
+            .flat_map(|k| k.ids.into_iter())
+            .map(|sid| {
+                let fields: HashMap<String, String> = sid
+                    .map
+                    .iter()
+                    .filter_map(|(k, v)| match v {
+                        redis::Value::BulkString(b) => {
+                            String::from_utf8(b.clone()).ok().map(|s| (k.clone(), s))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (sid.id, fields)
             })
-            .collect();
-        self.process_message(conn, &id, &fields).await.map(Some)
+            .collect())
     }
 
-    /// Politica F2 compartida por `XREADGROUP` y `XAUTOCLAIM`.
-    async fn process_message(
-        &self,
+    /// Despacha una tarea de procesamiento. El permiso del bulkhead se toma
+    /// dentro de la tarea: mientras espera, solo retiene el payload chico.
+    fn spawn_job(
+        ctx: &JobContext<S, K>,
+        sem: &Arc<Semaphore>,
         conn: &MultiplexedConnection,
-        msg_id: &str,
-        fields: &HashMap<String, String>,
-    ) -> Result<MessageOutcome, RunnerError> {
-        match WorkItem::from_stream_fields(fields) {
-            Ok(item) => match item.validate_schema() {
-                Ok(()) => {
-                    let attempts = self.delivery_count(conn, msg_id).await?;
-                    if attempts > self.cfg.max_attempts as u64 {
-                        eprintln!(
-                            "max_attempts superado ({attempts} > {}) -> DLQ atomica",
-                            self.cfg.max_attempts
-                        );
-                        let message = format!(
-                            "agoto {} intentos (delivery count {attempts})",
-                            self.cfg.max_attempts
-                        );
-                        return self
-                            .dlq_move(
-                                conn,
-                                msg_id,
-                                &item,
-                                MAX_ATTEMPTS_EXCEEDED,
-                                &message,
-                                ErrorKind::Transient,
-                            )
-                            .await
-                            .map(|_| MessageOutcome::SentToDlq);
-                    }
-                    Ok(MessageOutcome::NeedsProcessing)
-                }
-                Err(issue) => self.dlq_by_contract(conn, msg_id, &item, &issue).await,
-            },
+        jobs: &mut JoinSet<()>,
+        msg_id: String,
+        fields: HashMap<String, String>,
+    ) {
+        let ctx = ctx.clone();
+        let conn = conn.clone();
+        let sem = sem.clone();
+        jobs.spawn(async move {
+            let _permit: OwnedSemaphorePermit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return, // sem cerrado: apagado en curso
+            };
+            Self::run_job(ctx, conn, msg_id, fields).await;
+        });
+    }
+
+    /// Politica F3 compartida por `XREADGROUP` y `XAUTOCLAIM`.
+    async fn run_job(
+        ctx: JobContext<S, K>,
+        conn: MultiplexedConnection,
+        msg_id: String,
+        fields: HashMap<String, String>,
+    ) {
+        let cfg = &ctx.cfg;
+        let item = match WorkItem::from_stream_fields(&fields) {
+            Ok(item) => item,
             Err(issue) => {
                 eprintln!("contrato invalido: {issue} -> DLQ atomica");
-                let item = best_effort_item(fields);
-                self.dlq_by_contract(conn, msg_id, &item, &issue).await
+                let item = best_effort_item(&fields);
+                let (code, kind) = contract_cause(&issue);
+                Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind)
+                    .await;
+                return;
+            }
+        };
+        if let Err(issue) = item.validate_schema() {
+            let (code, kind) = contract_cause(&issue);
+            eprintln!("{issue} -> DLQ atomica");
+            Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind).await;
+            return;
+        }
+
+        // S2-P3-07: sin reintentar el trabajo si ya agoto sus intentos.
+        let attempts = match Self::delivery_count(&ctx, &conn, &msg_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("no se pudo leer el delivery count de {msg_id}: {e}; queda pendiente");
+                return;
+            }
+        };
+        if attempts > cfg.max_attempts as u64 {
+            eprintln!(
+                "max_attempts superado ({attempts} > {}) -> DLQ atomica",
+                cfg.max_attempts
+            );
+            let message = format!(
+                "agoto {} intentos (delivery count {attempts})",
+                cfg.max_attempts
+            );
+            Self::dlq_and_log(
+                &ctx,
+                &conn,
+                &msg_id,
+                &item,
+                MAX_ATTEMPTS_EXCEEDED,
+                &message,
+                ErrorKind::Transient,
+            )
+            .await;
+            return;
+        }
+
+        // S2-P3-01/03: pipeline con bulkhead implicito (esta tarea tiene
+        // permiso). Exito -> XACK; documento roto -> DLQ; infra -> pendiente.
+        match ctx.pipeline.process(&item).await {
+            Ok(()) => match Self::ack(&ctx, &conn, &msg_id).await {
+                Ok(()) => eprintln!("documento {} completado y ACK-eado", item.document_id),
+                Err(e) => {
+                    eprintln!(
+                        "documento {} procesado pero el XACK fallo ({e}): queda pendiente y se reprocesara (put idempotente)",
+                        item.document_id
+                    );
+                }
+            },
+            Err(Failure::Document { code, message }) => {
+                Self::dlq_and_log(
+                    &ctx,
+                    &conn,
+                    &msg_id,
+                    &item,
+                    &code,
+                    &message,
+                    ErrorKind::Business,
+                )
+                .await;
+            }
+            Err(Failure::Transient { code, message }) | Err(Failure::Fatal { code, message }) => {
+                eprintln!(
+                    "documento {}: infraestructura {} ({message}); queda pendiente",
+                    item.document_id, code
+                );
+            }
+            Err(Failure::CircuitOpen) => {
+                eprintln!(
+                    "documento {}: circuito de MinIO abierto; queda pendiente",
+                    item.document_id
+                );
             }
         }
     }
 
-    async fn dlq_by_contract(
-        &self,
+    async fn ack(
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         msg_id: &str,
-        item: &WorkItem,
-        issue: &extraction_core::ContractError,
-    ) -> Result<MessageOutcome, RunnerError> {
-        let (code, kind) = contract_cause(issue);
-        self.dlq_move(conn, msg_id, item, code, &issue.to_string(), kind)
-            .await
-            .map(|_| MessageOutcome::SentToDlq)
+    ) -> Result<(), Failure> {
+        let cfg = &ctx.cfg;
+        Self::retry_redis(ctx, conn, |mut c| {
+            let id = msg_id.to_string();
+            async move {
+                let acked: i64 = match timeout(
+                    REDIS_OP_TIMEOUT,
+                    c.xack(&cfg.stream, &cfg.group, &[id.as_str()]),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(classify_redis_error(&e)),
+                    Err(_) => {
+                        return Err(Failure::transient(REDIS_TIMEOUT_CODE, "xack timeout"));
+                    }
+                };
+                let _ = acked;
+                Ok(())
+            }
+        })
+        .await
     }
 
     /// `XAUTOCLAIM` con cursor persistente (S1-P3-05): reclama huerfanos con
-    /// `min_idle_ms > 2x job_timeout` y les aplica la misma politica F2.
+    /// `min_idle_ms > 2x job_timeout` y los procesa igual que los nuevos.
     async fn do_autoclaim(
-        &self,
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         cursor: &mut String,
+        sem: &Arc<Semaphore>,
+        jobs: &mut JoinSet<()>,
     ) -> Result<(), RunnerError> {
-        let cfg = &self.cfg;
-        let reply: StreamAutoClaimReply = self
-            .retry_redis(conn, |mut c| {
-                let start = cursor.clone();
-                async move {
-                    let opts = StreamAutoClaimOptions::default().count(cfg.count);
-                    match timeout(
-                        REDIS_OP_TIMEOUT,
-                        c.xautoclaim_options(
-                            &cfg.stream,
-                            &cfg.group,
-                            &cfg.consumer_name,
-                            cfg.min_idle_ms,
-                            start.as_str(),
-                            opts,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => Err(classify_redis_error(&e)),
-                        Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xautoclaim timeout")),
-                    }
+        let cfg = &ctx.cfg;
+        let reply: StreamAutoClaimReply = Self::retry_redis(ctx, conn, |mut c| {
+            let start = cursor.clone();
+            async move {
+                let opts = StreamAutoClaimOptions::default().count(cfg.count);
+                match timeout(
+                    REDIS_OP_TIMEOUT,
+                    c.xautoclaim_options(
+                        &cfg.stream,
+                        &cfg.group,
+                        &cfg.consumer_name,
+                        cfg.min_idle_ms,
+                        start.as_str(),
+                        opts,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => Err(classify_redis_error(&e)),
+                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xautoclaim timeout")),
                 }
-            })
-            .await?;
+            }
+        })
+        .await?;
         *cursor = reply.next_stream_id;
 
-        for entry in &reply.claimed {
+        for entry in reply.claimed {
             let fields: HashMap<String, String> = entry
                 .map
                 .iter()
@@ -292,9 +414,7 @@ impl ConsumerRunner {
                     _ => None,
                 })
                 .collect();
-            if let Err(e) = self.process_message(conn, &entry.id, &fields).await {
-                eprintln!("xautoclaim: no se pudo procesar {}: {e}", entry.id);
-            }
+            Self::spawn_job(ctx, sem, conn, jobs, entry.id, fields);
         }
         if !reply.deleted_ids.is_empty() {
             eprintln!(
@@ -308,36 +428,34 @@ impl ConsumerRunner {
     /// Delivery count del mensaje con Retry+CB; si falla se propaga para
     /// dejar el mensaje pendiente (nunca se DLQ-ea a ciegas).
     async fn delivery_count(
-        &self,
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         msg_id: &str,
-    ) -> Result<u64, RunnerError> {
-        let cfg = &self.cfg;
-        let n = self
-            .retry_redis(conn, |mut c| {
-                let id = msg_id.to_string();
-                async move {
-                    match timeout(
-                        REDIS_OP_TIMEOUT,
-                        dlq::get_delivery_count_by_id(&mut c, cfg, &id),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => Ok(n),
-                        Ok(Err(e)) => Err(Failure::from(e)),
-                        Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xpending timeout")),
-                    }
+    ) -> Result<u64, Failure> {
+        let cfg = &ctx.cfg;
+        Self::retry_redis(ctx, conn, |mut c| {
+            let id = msg_id.to_string();
+            async move {
+                match timeout(
+                    REDIS_OP_TIMEOUT,
+                    dlq::get_delivery_count_by_id(&mut c, cfg, &id),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => Ok(n),
+                    Ok(Err(e)) => Err(Failure::from(e)),
+                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xpending timeout")),
                 }
-            })
-            .await?;
-        Ok(n)
+            }
+        })
+        .await
     }
 
     /// DLQ atomica (XADD + XACK en un script Lua) con Retry+CB: el script es
     /// idempotente, asi que reintentar no duplica entradas en la DLQ.
     #[allow(clippy::too_many_arguments)]
     async fn dlq_move(
-        &self,
+        ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         msg_id: &str,
         item: &WorkItem,
@@ -345,36 +463,60 @@ impl ConsumerRunner {
         error_message: &str,
         error_kind: ErrorKind,
     ) -> Result<bool, RunnerError> {
-        let cfg = &self.cfg;
-        let moved = self
-            .retry_redis(conn, |mut c| {
-                let id = msg_id.to_string();
-                let item = item.clone();
-                let message = error_message.to_string();
-                async move {
-                    match timeout(
-                        REDIS_OP_TIMEOUT,
-                        dlq::move_to_dlq_with_cause(
-                            &mut c, cfg, &id, &item, error_code, &message, error_kind,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(moved)) => Ok(moved),
-                        Ok(Err(e)) => Err(Failure::from(e)),
-                        Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "dlq eval timeout")),
-                    }
+        let cfg = &ctx.cfg;
+        let moved = Self::retry_redis(ctx, conn, |mut c| {
+            let id = msg_id.to_string();
+            let item = item.clone();
+            let message = error_message.to_string();
+            async move {
+                match timeout(
+                    REDIS_OP_TIMEOUT,
+                    dlq::move_to_dlq_with_cause(
+                        &mut c, cfg, &id, &item, error_code, &message, error_kind,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(moved)) => Ok(moved),
+                    Ok(Err(e)) => Err(Failure::from(e)),
+                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "dlq eval timeout")),
                 }
-            })
-            .await?;
-        if moved {
-            eprintln!(
+            }
+        })
+        .await?;
+        Ok(moved)
+    }
+
+    async fn dlq_and_log(
+        ctx: &JobContext<S, K>,
+        conn: &MultiplexedConnection,
+        msg_id: &str,
+        item: &WorkItem,
+        error_code: &str,
+        error_message: &str,
+        error_kind: ErrorKind,
+    ) {
+        match Self::dlq_move(
+            ctx,
+            conn,
+            msg_id,
+            item,
+            error_code,
+            error_message,
+            error_kind,
+        )
+        .await
+        {
+            Ok(true) => eprintln!(
                 "documento {} movido a DLQ ({error_code}: {error_message})",
                 item.document_id
-            );
-        } else {
-            eprintln!("mensaje {msg_id} ya no esta pendiente: DLQ omitida (idempotente)");
+            ),
+            Ok(false) => {
+                eprintln!("mensaje {msg_id} ya no esta pendiente: DLQ omitida (idempotente)")
+            }
+            Err(e) => {
+                eprintln!("DLQ fallo para {msg_id}: {e}; queda pendiente para reintento");
+            }
         }
-        Ok(moved)
     }
 }
