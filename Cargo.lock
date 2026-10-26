@@ -790,6 +790,7 @@ dependencies = [
  "actix-web",
  "backoff",
  "extraction-core",
+ "futures-util",
  "hostname",
  "metrics",
  "metrics-exporter-prometheus",
