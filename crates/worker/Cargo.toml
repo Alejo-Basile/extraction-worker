@@ -21,6 +21,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 time = { version = "0.3", features = ["formatting"] }
 pdf-extract = "0.12.1"
 object_store = { version = "0.14.2", features = ["aws"] }
+mongodb = { version = "3.9.1", features = ["compat-3-3-0", "bson-3", "rustls-tls"] }
+lopdf = "0.42"
 
 [lints]
 workspace = true

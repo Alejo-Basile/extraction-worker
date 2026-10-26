@@ -55,6 +55,14 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         s3_access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "worker-dev".to_string()),
         s3_secret_key: std::env::var("S3_SECRET_KEY")
             .unwrap_or_else(|_| "worker-dev-secret".to_string()),
+        mongo_uri: std::env::var("MONGO_WORKER_URI").unwrap_or_else(|_| {
+            "mongodb://worker:worker-dev-secret@127.0.0.1:27017/app?authSource=app&directConnection=true"
+                .to_string()
+        }),
+        mongo_db: "app".to_string(),
+        mongo_timeout: Duration::from_secs(2),
+        max_pages: 2000,
+        max_output_bytes: 1024 * 1024,
     }
 }
 
