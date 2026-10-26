@@ -33,9 +33,11 @@ pub trait ObjectSource: Send + Sync + 'static {
     ) -> impl Future<Output = Result<u64, Failure>> + Send;
 }
 
-/// Puerto de subida del texto extraido: put idempotente (S2-P3-08).
+/// Puerto de subida del texto extraido: put idempotente (S2-P3-08) y
+/// delete para la compensacion (S2-P3-09).
 pub trait TextSink: Send + Sync + 'static {
     fn put_text(&self, key: &str, text: &str) -> impl Future<Output = Result<(), Failure>> + Send;
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), Failure>> + Send;
 }
 
 /// Archivo temporal con limpieza garantizada (Drop borra el archivo).
@@ -92,6 +94,8 @@ pub struct ExtractionPipeline<S: ObjectSource, K: TextSink> {
     breaker: Arc<CircuitBreaker>,
     job_timeout: Duration,
     max_pdf_bytes: u64,
+    /// Tope del texto extraido antes del PUT (§11.5).
+    max_output_bytes: u64,
 }
 
 impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
@@ -102,6 +106,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         breaker: Arc<CircuitBreaker>,
         job_timeout: Duration,
         max_pdf_bytes: u64,
+        max_output_bytes: u64,
     ) -> Self {
         Self {
             source,
@@ -110,6 +115,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             breaker,
             job_timeout,
             max_pdf_bytes,
+            max_output_bytes,
         }
     }
     /// Procesa el item completo. Devuelve `Ok(())` si el `.txt` quedo subido;
@@ -120,6 +126,16 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             let temp = TempPdf::create()?;
             self.download(&item.object_key, &temp).await?;
             let text = self.extract(&temp).await?;
+            if text.len() as u64 > self.max_output_bytes {
+                return Err(Failure::Document {
+                    code: extraction_core::error_code::PDF_OUTPUT_TOO_LARGE.to_string(),
+                    message: format!(
+                        "el texto extraido ({} bytes) supera el tope de {}",
+                        text.len(),
+                        self.max_output_bytes
+                    ),
+                });
+            }
             let key = txt_key(&item.document_id);
             self.upload(&key, &text).await
         };
@@ -172,6 +188,20 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             let key = key.clone();
             let text = text.clone();
             async move { with_s3_timeout(|| async { sink.put_text(&key, &text).await }).await }
+        })
+        .await
+    }
+
+    /// Compensacion del paso 5 (S2-P3-09): si el cierre en Mongo fallo tras
+    /// reintentos, borrar el `.txt` recien subido para no dejar huerfanos.
+    /// El delete es idempotente; reintentarlo es seguro.
+    pub async fn compensate(&self, item: &extraction_core::WorkItem) -> Result<(), Failure> {
+        let sink = self.sink.clone();
+        let key = txt_key(&item.document_id);
+        with_retry_cb(&self.breaker, || {
+            let sink = sink.clone();
+            let key = key.clone();
+            async move { with_s3_timeout(|| async { sink.delete(&key).await }).await }
         })
         .await
     }
@@ -230,6 +260,14 @@ impl TextSink for InMemorySink {
             .insert(key.to_string(), text.to_string());
         Ok(())
     }
+
+    async fn delete(&self, key: &str) -> Result<(), Failure> {
+        self.files
+            .lock()
+            .map_err(|_| Failure::transient("TEST_LOCK", "lock envenenado"))?
+            .remove(key);
+        Ok(())
+    }
 }
 
 /// Pipeline real: MinIO (object_store) + `pdf-extract`, construido desde
@@ -249,10 +287,11 @@ impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::Objec
         Ok(Self {
             source: Arc::new(source),
             sink: Arc::new(sink),
-            extractor: Arc::new(crate::extract::PdfExtractor),
+            extractor: Arc::new(crate::extract::PdfExtractor::new(cfg.max_pages)),
             breaker: crate::objects::minio_breaker(),
             job_timeout: cfg.job_timeout,
             max_pdf_bytes: cfg.max_pdf_bytes,
+            max_output_bytes: cfg.max_output_bytes,
         })
     }
 }
@@ -287,6 +326,7 @@ mod tests {
             extractor,
             Arc::new(CircuitBreaker::default()),
             job_timeout,
+            1024 * 1024,
             1024 * 1024,
         )
     }
@@ -409,6 +449,7 @@ mod tests {
             Arc::new(FakeTextExtractor::returning("ok")),
             Arc::new(CircuitBreaker::default()),
             Duration::from_secs(5),
+            1024 * 1024,
             1024 * 1024,
         );
         let item = work_item();
