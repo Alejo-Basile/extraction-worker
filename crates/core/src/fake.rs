@@ -1,6 +1,7 @@
 //! Implementacion fake de `TextExtractor` para tests (S0-P3-06).
 
 use crate::{ErrorKind, ExtractorError, TextExtractor};
+use std::path::Path;
 
 /// Extractor fake deterministico. No lee PDFs reales: devuelve contenido
 /// estable segun el input para facilitar tests.
@@ -35,7 +36,7 @@ impl FakeTextExtractor {
 }
 
 impl TextExtractor for FakeTextExtractor {
-    fn extract(&self, _pdf: &[u8]) -> Result<String, ExtractorError> {
+    fn extract(&self, _pdf_path: &Path) -> Result<String, ExtractorError> {
         if let Some(code) = self.error_code.clone() {
             return Err(ExtractorError {
                 code,
@@ -54,14 +55,14 @@ mod tests {
     #[test]
     fn fake_devuelve_texto_deterministico() {
         let ext = FakeTextExtractor::returning("hola mundo");
-        let res = ext.extract(b"%PDF-1.4\nfake\n");
+        let res = ext.extract(Path::new("fixture.pdf"));
         assert!(matches!(res, Ok(s) if s == "hola mundo"));
     }
 
     #[test]
     fn fake_devuelve_error_de_negocio() {
         let ext = FakeTextExtractor::failing("PDF_CORRUPT", "xref roto");
-        let res = ext.extract(b"not pdf");
+        let res = ext.extract(Path::new("fixture.pdf"));
         match res {
             Err(err) => {
                 assert_eq!(err.code, "PDF_CORRUPT");

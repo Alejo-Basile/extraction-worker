@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod fake;
+
 /// Version del esquema del contrato JSON (seccion 11.3).
 /// Un worker que no entiende la version NO procesa el mensaje: va a la DLQ
 /// con `error_code: UNSUPPORTED_SCHEMA_VERSION`.
@@ -27,6 +29,14 @@ pub mod error_code {
     pub const UNSUPPORTED_SCHEMA_VERSION: &str = "UNSUPPORTED_SCHEMA_VERSION";
     /// El mensaje agoto `WORKER_MAX_ATTEMPTS` entregas sin procesarse.
     pub const MAX_ATTEMPTS_EXCEEDED: &str = "MAX_ATTEMPTS_EXCEEDED";
+    /// El PDF no se pudo parsear (xref roto, estructura invalida).
+    pub const PDF_CORRUPT: &str = "PDF_CORRUPT";
+    /// El PDF esta cifrado y el worker no tiene contrasenia.
+    pub const PDF_ENCRYPTED: &str = "PDF_ENCRYPTED";
+    /// El PDF se parseo pero no tiene texto extraible (escaneado).
+    pub const PDF_NO_TEXT: &str = "PDF_NO_TEXT";
+    /// El objeto supera `WORKER_MAX_PDF_BYTES` (defensa en profundidad).
+    pub const PDF_TOO_LARGE: &str = "PDF_TOO_LARGE";
 }
 
 /// Mensaje en la DLQ (seccion 11.3). Anade el diagnostico al mensaje original;
@@ -182,12 +192,14 @@ impl std::fmt::Display for ExtractorError {
 
 impl std::error::Error for ExtractorError {}
 
-/// Puerto de extraccion de texto (S0-P3-06).
+/// Puerto de extraccion de texto (S0-P3-06, S2-P3-01).
 ///
 /// Sincrono a proposito: la extraccion de PDF es CPU-bound; el adaptador
-/// concreto decidira como ejecutarla (spawn_blocking, subproceso, ver SDD 3.3).
+/// concreto decidira como ejecutarla (spawn_blocking, ver SDD 3.3). Recibe la
+/// ruta del PDF ya descargado a un archivo temporal (S2-P3-01): el binario
+/// nunca se mantiene completo en la memoria del worker.
 pub trait TextExtractor: Send + Sync {
-    fn extract(&self, pdf: &[u8]) -> Result<String, ExtractorError>;
+    fn extract(&self, pdf_path: &std::path::Path) -> Result<String, ExtractorError>;
 }
 
 #[cfg(test)]
