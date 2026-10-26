@@ -15,6 +15,16 @@ pub struct ConsumerConfig {
     pub xautoclaim_interval: Duration,
     pub max_attempts: usize,
     pub dlq_stream: String,
+    /// Bulkhead por instancia (S2-P3-03): extracciones en paralelo.
+    pub max_concurrency: usize,
+    /// Limite duro del PDF descargado (defensa en profundidad, S2-P3-01).
+    pub max_pdf_bytes: u64,
+    /// S3/MinIO (seccion 11.4): GET raw-pdfs y PUT extracted-txt.
+    pub s3_endpoint: String,
+    pub s3_bucket_raw: String,
+    pub s3_bucket_txt: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -64,6 +74,13 @@ impl ConsumerConfig {
             )),
             max_attempts: env_usize_or("WORKER_MAX_ATTEMPTS", 5),
             dlq_stream: env_or("REDIS_DLQ_STREAM", "stream:pdf-processing-dlq"),
+            max_concurrency: env_usize_or("WORKER_MAX_CONCURRENCY", 4),
+            max_pdf_bytes: env_u64_or("WORKER_MAX_PDF_BYTES", 30 * 1024 * 1024),
+            s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
+            s3_bucket_raw: env_or("S3_BUCKET_RAW", "raw-pdfs"),
+            s3_bucket_txt: env_or("S3_BUCKET_TXT", "extracted-txt"),
+            s3_access_key: env_or("S3_ACCESS_KEY", ""),
+            s3_secret_key: env_or("S3_SECRET_KEY", ""),
         }
     }
 }
