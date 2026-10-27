@@ -97,10 +97,32 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: start mongo (rs0 + auth + rol del worker, ADR-0006)
+        run: |
+          docker run -d --name mongo -p 27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=root \
+            -e MONGO_INITDB_ROOT_PASSWORD=worker-dev-root \
+            mongo:7 \
+            bash -c 'if [ ! -f /data/db/keyfile ]; then openssl rand -base64 75 > /data/db/keyfile; fi; chmod 400 /data/db/keyfile; exec docker-entrypoint.sh mongod --replSet rs0 --auth --keyFile /data/db/keyfile --bind_ip_all'
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet -u root -p worker-dev-root --authenticationDatabase admin --eval 'try { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]}) } catch (e) { print(e.message) }' && break || sleep 2
+          done
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet -u root -p worker-dev-root --authenticationDatabase admin --eval 'try { db.hello().isWritablePrimary } catch (e) { false }' | grep -q true && break || sleep 2
+          done
+          docker exec mongo mongosh --quiet -u root -p worker-dev-root --authenticationDatabase admin --eval '
+            const app = db.getSiblingDB("app");
+            try { app.createCollection("documents") } catch (e) { print(e.message) }
+            try { app.createRole({role: "workerUpdateDocuments", privileges: [{resource: {db: "app", collection: "documents"}, actions: ["update"]}], roles: []}) } catch (e) { print(e.message) }
+            try { app.createUser({user: "worker", pwd: "worker-dev-secret", roles: [{role: "workerUpdateDocuments", db: "app"}]}) } catch (e) { print(e.message) }
+          '
+
       - name: cargo test ignored
         env:
           REDIS_TEST_URL: redis://127.0.0.1:6379/
           S3_ENDPOINT: http://127.0.0.1:9000
           S3_ACCESS_KEY: worker-dev
           S3_SECRET_KEY: worker-dev-secret
+          MONGO_WORKER_URI: mongodb://worker:worker-dev-secret@127.0.0.1:27017/app?authSource=app&directConnection=true
+          MONGO_TEST_ROOT_URI: mongodb://root:worker-dev-root@127.0.0.1:27017/?directConnection=true
         run: cargo test --all-features -- --ignored
