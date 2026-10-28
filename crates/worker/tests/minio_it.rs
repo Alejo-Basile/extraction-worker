@@ -127,6 +127,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         mongo_timeout: Duration::from_secs(2),
         max_pages: 2000,
         max_output_bytes: 1024 * 1024,
+        metrics_interval: std::time::Duration::from_secs(15),
     };
     let pipeline = must(ExtractionPipeline::from_env(&cfg));
     let item = extraction_core::WorkItem {

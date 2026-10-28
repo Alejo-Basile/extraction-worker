@@ -33,6 +33,8 @@ pub struct ConsumerConfig {
     pub max_pages: u32,
     /// Tope del texto extraido antes del PUT (§11.5).
     pub max_output_bytes: u64,
+    /// Periodo de refresco de los gauges de cola (DoD 3 / S0-P3-05).
+    pub metrics_interval: Duration,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -97,6 +99,9 @@ impl ConsumerConfig {
             mongo_timeout: Duration::from_millis(env_u64_or("MONGO_TIMEOUT_MS", 3000)),
             max_pages: env_u64_or("WORKER_MAX_PAGES", 2000) as u32,
             max_output_bytes: env_u64_or("WORKER_MAX_OUTPUT_BYTES", 52_428_800),
+            metrics_interval: Duration::from_secs(
+                env_u64_or("WORKER_METRICS_INTERVAL_SECS", 15).max(1),
+            ),
         }
     }
 }

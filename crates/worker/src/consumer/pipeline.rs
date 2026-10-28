@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use extraction_core::TextExtractor;
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 use crate::consumer::resilience::{with_retry_cb, CircuitBreaker, Failure};
 use crate::objects::with_s3_timeout;
@@ -118,10 +119,23 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             max_output_bytes,
         }
     }
+    /// Breaker de MinIO, expuesto para el gauge `worker_breaker_open`.
+    pub fn breaker(&self) -> Arc<CircuitBreaker> {
+        self.breaker.clone()
+    }
+
     /// Procesa el item completo. Devuelve `Ok(())` si el `.txt` quedo subido;
     /// `Err(Failure::Document)` para errores del documento (van a DLQ) y
     /// `Err(Failure::Transient|Fatal|CircuitOpen)` para infraestructura.
     pub async fn process(&self, item: &extraction_core::WorkItem) -> Result<(), Failure> {
+        let started = std::time::Instant::now();
+        info!(
+            service = crate::telemetry::SERVICE,
+            msg = "extraccion iniciada",
+            correlation_id = %item.correlation_id,
+            document_id = %item.document_id,
+            object_key = %item.object_key
+        );
         let job = async {
             let temp = TempPdf::create()?;
             self.download(&item.object_key, &temp).await?;
@@ -139,13 +153,38 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             let key = txt_key(&item.document_id);
             self.upload(&key, &text).await
         };
-        match timeout(self.job_timeout, job).await {
+        let result = match timeout(self.job_timeout, job).await {
             Ok(res) => res,
             Err(_) => Err(Failure::transient(
                 "JOB_TIMEOUT",
                 format!("job timeout tras {:?}", self.job_timeout),
             )),
+        };
+        let outcome = match &result {
+            Ok(()) => "ok",
+            Err(Failure::Document { .. }) => "document",
+            Err(_) => "infra",
+        };
+        metrics::histogram!("worker_extraction_seconds", "outcome" => outcome)
+            .record(started.elapsed().as_secs_f64());
+        match &result {
+            Ok(()) => info!(
+                service = crate::telemetry::SERVICE,
+                msg = "extraccion completada",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                outcome
+            ),
+            Err(e) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "extraccion fallida",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                outcome,
+                error = %e
+            ),
         }
+        result
     }
 
     async fn download(&self, key: &str, temp: &TempPdf) -> Result<u64, Failure> {
@@ -196,6 +235,12 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
     /// reintentos, borrar el `.txt` recien subido para no dejar huerfanos.
     /// El delete es idempotente; reintentarlo es seguro.
     pub async fn compensate(&self, item: &extraction_core::WorkItem) -> Result<(), Failure> {
+        info!(
+            service = crate::telemetry::SERVICE,
+            msg = "compensando: borrando txt huerfano",
+            correlation_id = %item.correlation_id,
+            document_id = %item.document_id
+        );
         let sink = self.sink.clone();
         let key = txt_key(&item.document_id);
         with_retry_cb(&self.breaker, || {

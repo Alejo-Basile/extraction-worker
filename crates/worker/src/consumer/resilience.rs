@@ -112,6 +112,16 @@ impl CircuitBreaker {
         }
     }
 
+    /// Estado observado por las metricas `worker_breaker_open`.
+    /// `HalfOpen` cuenta como abierto: sigue rechazando trafico (salvo el
+    /// unico probe) hasta que el exito lo cierre.
+    pub fn is_open(&self) -> bool {
+        match self.state.lock() {
+            Ok(st) => !matches!(*st, CbState::Closed { .. }),
+            Err(_) => false,
+        }
+    }
+
     pub fn on_success(&self) {
         if let Ok(mut st) = self.state.lock() {
             *st = CbState::Closed { failures: 0 };
@@ -209,6 +219,19 @@ mod tests {
         assert!(cb.allow(), "por debajo del umbral sigue cerrado");
         cb.on_failure();
         assert!(!cb.allow(), "al alcanzar el umbral debe abrir");
+    }
+
+    #[test]
+    fn breaker_reporta_estado_para_metricas() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(500));
+        assert!(!cb.is_open());
+        cb.on_failure();
+        assert!(cb.is_open());
+        std::thread::sleep(Duration::from_millis(520));
+        assert!(cb.allow(), "pasa a halfopen");
+        assert!(cb.is_open(), "halfopen sigue degradado hasta el exito");
+        cb.on_success();
+        assert!(!cb.is_open());
     }
 
     #[test]
