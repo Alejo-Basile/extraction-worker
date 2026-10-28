@@ -39,6 +39,8 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use crate::document_store::{mongo_breaker, DocumentStore};
+
 use super::classify::classify_redis_error;
 use super::config::ConsumerConfig;
 use super::dlq::{self, best_effort_item, contract_cause};
@@ -71,7 +73,9 @@ const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
 pub struct JobContext<S: ObjectSource, K: TextSink> {
     pub cfg: ConsumerConfig,
     pub pipeline: Arc<ExtractionPipeline<S, K>>,
+    pub documents: Arc<DocumentStore>,
     pub redis_breaker: Arc<CircuitBreaker>,
+    pub mongo_breaker: Arc<CircuitBreaker>,
 }
 
 impl<S: ObjectSource, K: TextSink> Clone for JobContext<S, K> {
@@ -79,7 +83,9 @@ impl<S: ObjectSource, K: TextSink> Clone for JobContext<S, K> {
         Self {
             cfg: self.cfg.clone(),
             pipeline: self.pipeline.clone(),
+            documents: self.documents.clone(),
             redis_breaker: self.redis_breaker.clone(),
+            mongo_breaker: self.mongo_breaker.clone(),
         }
     }
 }
@@ -91,13 +97,19 @@ pub struct ConsumerRunner<S: ObjectSource, K: TextSink> {
 }
 
 impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
-    pub fn new(cfg: ConsumerConfig, pipeline: Arc<ExtractionPipeline<S, K>>) -> Self {
+    pub fn new(
+        cfg: ConsumerConfig,
+        pipeline: Arc<ExtractionPipeline<S, K>>,
+        documents: Arc<DocumentStore>,
+    ) -> Self {
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency));
         Self {
             ctx: JobContext {
                 cfg,
                 pipeline,
+                documents,
                 redis_breaker: Arc::new(CircuitBreaker::default()),
+                mongo_breaker: mongo_breaker(),
             },
             sem,
         }
@@ -300,42 +312,157 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             return;
         }
 
+        // Reclamo en Mongo (S2-P3-08): QUEUED|RETRYING -> PROCESSING con
+        // status_history. Si no matchea, otro actor ya movio el estado: el
+        // mensaje es una entrega duplicada y se ACK-ea sin reprocesar.
+        match Self::claim(&ctx, &item).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "documento {} no reclambiable (estado movido por otro actor): entrega duplicada, se ACK-ea",
+                    item.document_id
+                );
+                Self::ack_and_log(&ctx, &conn, &msg_id, &item.document_id).await;
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "documento {}: no se pudo reclamar en Mongo ({e}); queda pendiente",
+                    item.document_id
+                );
+                return;
+            }
+        }
+
         // S2-P3-01/03: pipeline con bulkhead implicito (esta tarea tiene
-        // permiso). Exito -> XACK; documento roto -> DLQ; infra -> pendiente.
-        match ctx.pipeline.process(&item).await {
-            Ok(()) => match Self::ack(&ctx, &conn, &msg_id).await {
-                Ok(()) => eprintln!("documento {} completado y ACK-eado", item.document_id),
-                Err(e) => {
+        // permiso). Documento roto -> DLQ; infra -> pendiente.
+        if let Err(f) = ctx.pipeline.process(&item).await {
+            match f {
+                Failure::Document { code, message } => {
+                    Self::dlq_and_log(
+                        &ctx,
+                        &conn,
+                        &msg_id,
+                        &item,
+                        &code,
+                        &message,
+                        ErrorKind::Business,
+                    )
+                    .await;
+                }
+                Failure::Transient { code, message } | Failure::Fatal { code, message } => {
                     eprintln!(
-                        "documento {} procesado pero el XACK fallo ({e}): queda pendiente y se reprocesara (put idempotente)",
+                        "documento {}: infraestructura {} ({message}); queda pendiente",
+                        item.document_id, code
+                    );
+                }
+                Failure::CircuitOpen => {
+                    eprintln!(
+                        "documento {}: circuito de MinIO abierto; queda pendiente",
                         item.document_id
                     );
                 }
-            },
-            Err(Failure::Document { code, message }) => {
-                Self::dlq_and_log(
-                    &ctx,
-                    &conn,
-                    &msg_id,
-                    &item,
-                    &code,
-                    &message,
-                    ErrorKind::Business,
-                )
-                .await;
             }
-            Err(Failure::Transient { code, message }) | Err(Failure::Fatal { code, message }) => {
-                eprintln!(
-                    "documento {}: infraestructura {} ({message}); queda pendiente",
-                    item.document_id, code
-                );
+            return;
+        }
+
+        // Paso 5 (S2-P3-08): cierre condicional PROCESSING -> COMPLETED.
+        match Self::complete(&ctx, &item).await {
+            Ok(true) | Ok(false) => {
+                // Ok(false): otro actor cerro o movio el documento; el .txt
+                // subido es identico (put idempotente) y el estado ajeno no
+                // se pisa. En ambos casos la entrega se confirma.
+                Self::ack_and_log(&ctx, &conn, &msg_id, &item.document_id).await;
             }
-            Err(Failure::CircuitOpen) => {
+            Err(e) => {
+                // Compensacion (S2-P3-09): borrar el .txt y dejar el documento
+                // en PROCESSING para el reconciliador. El mensaje queda
+                // pendiente y se reclamara de nuevo.
                 eprintln!(
-                    "documento {}: circuito de MinIO abierto; queda pendiente",
+                    "documento {}: el cierre en Mongo fallo ({e}); se compensa el .txt y queda pendiente",
                     item.document_id
                 );
+                match ctx.pipeline.compensate(&item).await {
+                    Ok(()) => eprintln!(
+                        "documento {}: .txt compensado (0 huerfanos)",
+                        item.document_id
+                    ),
+                    Err(ce) => eprintln!(
+                        "documento {}: la compensacion del .txt fallo ({ce}); revisar el bucket",
+                        item.document_id
+                    ),
+                }
             }
+        }
+    }
+
+    async fn claim(ctx: &JobContext<S, K>, item: &WorkItem) -> Result<bool, Failure> {
+        let documents = ctx.documents.clone();
+        let document_id = item.document_id.clone();
+        let correlation_id = item.correlation_id.clone();
+        let now = now_rfc3339();
+        let mongo_timeout = ctx.cfg.mongo_timeout;
+        with_retry_cb(&ctx.mongo_breaker, || {
+            let documents = documents.clone();
+            let document_id = document_id.clone();
+            let correlation_id = correlation_id.clone();
+            let now = now.clone();
+            async move {
+                match timeout(
+                    mongo_timeout,
+                    documents.claim(&document_id, &correlation_id, &now),
+                )
+                .await
+                {
+                    Ok(Ok(claimed)) => Ok(claimed),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(Failure::transient("MONGO_TIMEOUT", "claim timeout")),
+                }
+            }
+        })
+        .await
+    }
+
+    async fn complete(ctx: &JobContext<S, K>, item: &WorkItem) -> Result<bool, Failure> {
+        let documents = ctx.documents.clone();
+        let document_id = item.document_id.clone();
+        let correlation_id = item.correlation_id.clone();
+        let txt_ref = super::pipeline::txt_key(&item.document_id);
+        let now = now_rfc3339();
+        let mongo_timeout = ctx.cfg.mongo_timeout;
+        with_retry_cb(&ctx.mongo_breaker, || {
+            let documents = documents.clone();
+            let document_id = document_id.clone();
+            let correlation_id = correlation_id.clone();
+            let txt_ref = txt_ref.clone();
+            let now = now.clone();
+            async move {
+                match timeout(
+                    mongo_timeout,
+                    documents.complete(&document_id, &txt_ref, &correlation_id, &now),
+                )
+                .await
+                {
+                    Ok(Ok(closed)) => Ok(closed),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(Failure::transient("MONGO_TIMEOUT", "complete timeout")),
+                }
+            }
+        })
+        .await
+    }
+
+    async fn ack_and_log(
+        ctx: &JobContext<S, K>,
+        conn: &MultiplexedConnection,
+        msg_id: &str,
+        document_id: &str,
+    ) {
+        match Self::ack(ctx, conn, msg_id).await {
+            Ok(()) => eprintln!("documento {document_id} completado y ACK-eado"),
+            Err(e) => eprintln!(
+                "documento {document_id} procesado pero el XACK fallo ({e}): queda pendiente y se reprocesara (put idempotente)"
+            ),
         }
     }
 
@@ -519,4 +646,11 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             }
         }
     }
+}
+
+/// Reloj del worker para `updated_at`/`completed_at`/`status_history.at`.
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }

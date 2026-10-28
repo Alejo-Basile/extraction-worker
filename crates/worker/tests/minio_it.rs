@@ -122,6 +122,11 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         dlq_stream: String::new(),
         max_concurrency: 1,
         max_pdf_bytes: 1024 * 1024,
+        mongo_uri: String::new(),
+        mongo_db: "app".to_string(),
+        mongo_timeout: Duration::from_secs(2),
+        max_pages: 2000,
+        max_output_bytes: 1024 * 1024,
     };
     let pipeline = must(ExtractionPipeline::from_env(&cfg));
     let item = extraction_core::WorkItem {
