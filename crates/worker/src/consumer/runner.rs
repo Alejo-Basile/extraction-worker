@@ -38,6 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::document_store::{mongo_breaker, DocumentStore};
 
@@ -119,8 +120,20 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let ctx = &self.ctx;
         let client = redis::Client::open(ctx.cfg.redis_url.as_str())
             .map_err(|e| RunnerError::Config(e.to_string()))?;
-        let mut conn = Self::connect(ctx, &client).await?;
-        group::ensure_group(&mut conn, &ctx.cfg).await?;
+        // Apagado responsivo: el retry de conexion puede durar hasta 30s;
+        // el token lo corta sin esperar al presupuesto de apagado.
+        let mut conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = Self::connect(ctx, &client) => r?,
+        };
+        match tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = timeout(REDIS_OP_TIMEOUT, group::ensure_group(&mut conn, &ctx.cfg)) => r,
+        } {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(RunnerError::from(e)),
+            Err(_) => return Err(RunnerError::Config("ensure_group timeout".to_string())),
+        }
 
         let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
         autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -129,12 +142,25 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // mensajes sin terminar quedan pendientes y otro worker los reclama.
         let mut jobs: JoinSet<()> = JoinSet::new();
 
+        // Gauges de cola en una conexion propia (DoD 3): no bloquean el
+        // bucle de lectura ni consumen el bulkhead de extracciones.
+        let metrics = tokio::spawn(Self::metrics_loop(
+            ctx.clone(),
+            conn.clone(),
+            self.sem.clone(),
+            token.clone(),
+        ));
+
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = autoclaim_ticker.tick() => {
                     if let Err(e) = Self::do_autoclaim(ctx, &conn, &mut autoclaim_cursor, &self.sem, &mut jobs).await {
-                        eprintln!("xautoclaim error: {e}");
+                        warn!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "xautoclaim fallo",
+                            error = %e
+                        );
                     }
                 }
                 res = Self::read_batch(ctx, &conn) => {
@@ -145,7 +171,11 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("consumer error: {e}");
+                            warn!(
+                                service = crate::telemetry::SERVICE,
+                                msg = "lectura del stream fallo; reintentando",
+                                error = %e
+                            );
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
@@ -153,7 +183,75 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             }
         }
         drop(jobs);
+        let _ = metrics.await;
         Ok(())
+    }
+
+    /// Refresca gauges de cola y de estado interno cada
+    /// `WORKER_METRICS_INTERVAL_SECS` (default 15s).
+    async fn metrics_loop(
+        ctx: JobContext<S, K>,
+        conn: MultiplexedConnection,
+        sem: Arc<Semaphore>,
+        token: CancellationToken,
+    ) {
+        let mut ticker = interval(ctx.cfg.metrics_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => Self::update_gauges(&ctx, &conn, &sem).await,
+            }
+        }
+    }
+
+    async fn update_gauges(
+        ctx: &JobContext<S, K>,
+        conn: &MultiplexedConnection,
+        sem: &Arc<Semaphore>,
+    ) {
+        let in_flight = ctx
+            .cfg
+            .max_concurrency
+            .saturating_sub(sem.available_permits());
+        metrics::gauge!("worker_inflight").set(in_flight as f64);
+        for (dependency, open) in [
+            ("redis", ctx.redis_breaker.is_open()),
+            ("mongo", ctx.mongo_breaker.is_open()),
+            ("minio", ctx.pipeline.breaker().is_open()),
+        ] {
+            metrics::gauge!("worker_breaker_open", "dependency" => dependency).set(if open {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        if let Some(depth) = Self::stream_depth(ctx, conn).await {
+            metrics::gauge!("worker_stream_depth", "stream" => ctx.cfg.stream.clone())
+                .set(depth as f64);
+        }
+        if let Some(pending) = Self::pel_pending(ctx, conn).await {
+            metrics::gauge!("worker_pel_pending", "group" => ctx.cfg.group.clone())
+                .set(pending as f64);
+        }
+    }
+
+    async fn stream_depth(ctx: &JobContext<S, K>, conn: &MultiplexedConnection) -> Option<u64> {
+        let mut c = conn.clone();
+        let stream = ctx.cfg.stream.clone();
+        match timeout(REDIS_OP_TIMEOUT, c.xlen::<_, u64>(&stream)).await {
+            Ok(Ok(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    async fn pel_pending(ctx: &JobContext<S, K>, conn: &MultiplexedConnection) -> Option<u64> {
+        let mut c = conn.clone();
+        let cfg = ctx.cfg.clone();
+        match timeout(REDIS_OP_TIMEOUT, group::pending_summary(&mut c, &cfg)).await {
+            Ok(Ok(v)) => v.get("pending_count").and_then(serde_json::Value::as_u64),
+            _ => None,
+        }
     }
 
     /// Conexion inicial con Retry+CB de Redis: corta cuando el breaker lo
@@ -267,8 +365,15 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let item = match WorkItem::from_stream_fields(&fields) {
             Ok(item) => item,
             Err(issue) => {
-                eprintln!("contrato invalido: {issue} -> DLQ atomica");
                 let item = best_effort_item(&fields);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "contrato invalido; va a la DLQ",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    error = %issue
+                );
+                metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
                 let (code, kind) = contract_cause(&issue);
                 Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind)
                     .await;
@@ -276,8 +381,15 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             }
         };
         if let Err(issue) = item.validate_schema() {
+            warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "schema invalido; va a la DLQ",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                error = %issue
+            );
+            metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
             let (code, kind) = contract_cause(&issue);
-            eprintln!("{issue} -> DLQ atomica");
             Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind).await;
             return;
         }
@@ -286,19 +398,33 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let attempts = match Self::delivery_count(&ctx, &conn, &msg_id).await {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("no se pudo leer el delivery count de {msg_id}: {e}; queda pendiente");
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "no se pudo leer el delivery count; el mensaje queda pendiente",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    msg_id = %msg_id,
+                    error = %e
+                );
+                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
                 return;
             }
         };
         if attempts > cfg.max_attempts as u64 {
-            eprintln!(
-                "max_attempts superado ({attempts} > {}) -> DLQ atomica",
-                cfg.max_attempts
-            );
             let message = format!(
                 "agoto {} intentos (delivery count {attempts})",
                 cfg.max_attempts
             );
+            warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "max_attempts superado; va a la DLQ",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                attempts,
+                max_attempts = cfg.max_attempts,
+                error = %message
+            );
+            metrics::counter!("worker_documents_total", "outcome" => "failed").increment(1);
             Self::dlq_and_log(
                 &ctx,
                 &conn,
@@ -316,19 +442,30 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // status_history. Si no matchea, otro actor ya movio el estado: el
         // mensaje es una entrega duplicada y se ACK-ea sin reprocesar.
         match Self::claim(&ctx, &item).await {
-            Ok(true) => {}
+            Ok(true) => {
+                metrics::counter!("worker_claim_total", "result" => "claimed").increment(1);
+            }
             Ok(false) => {
-                eprintln!(
-                    "documento {} no reclambiable (estado movido por otro actor): entrega duplicada, se ACK-ea",
-                    item.document_id
+                metrics::counter!("worker_claim_total", "result" => "not_claimable").increment(1);
+                metrics::counter!("worker_documents_total", "outcome" => "duplicate").increment(1);
+                info!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "documento no reclamable; entrega duplicada, se ACK-ea",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id
                 );
-                Self::ack_and_log(&ctx, &conn, &msg_id, &item.document_id).await;
+                Self::ack_and_log(&ctx, &conn, &msg_id, &item).await;
                 return;
             }
             Err(e) => {
-                eprintln!(
-                    "documento {}: no se pudo reclamar en Mongo ({e}); queda pendiente",
-                    item.document_id
+                metrics::counter!("worker_claim_total", "result" => "error").increment(1);
+                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "no se pudo reclamar en Mongo; el mensaje queda pendiente",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    error = %e
                 );
                 return;
             }
@@ -339,6 +476,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         if let Err(f) = ctx.pipeline.process(&item).await {
             match f {
                 Failure::Document { code, message } => {
+                    metrics::counter!("worker_documents_total", "outcome" => "rejected")
+                        .increment(1);
                     Self::dlq_and_log(
                         &ctx,
                         &conn,
@@ -351,15 +490,25 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     .await;
                 }
                 Failure::Transient { code, message } | Failure::Fatal { code, message } => {
-                    eprintln!(
-                        "documento {}: infraestructura {} ({message}); queda pendiente",
-                        item.document_id, code
+                    metrics::counter!("worker_documents_total", "outcome" => "deferred")
+                        .increment(1);
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "fallo de infraestructura; el mensaje queda pendiente",
+                        correlation_id = %item.correlation_id,
+                        document_id = %item.document_id,
+                        code = %code,
+                        error = %message
                     );
                 }
                 Failure::CircuitOpen => {
-                    eprintln!(
-                        "documento {}: circuito de MinIO abierto; queda pendiente",
-                        item.document_id
+                    metrics::counter!("worker_documents_total", "outcome" => "deferred")
+                        .increment(1);
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "circuito de MinIO abierto; el mensaje queda pendiente",
+                        correlation_id = %item.correlation_id,
+                        document_id = %item.document_id
                     );
                 }
             }
@@ -372,25 +521,43 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 // Ok(false): otro actor cerro o movio el documento; el .txt
                 // subido es identico (put idempotente) y el estado ajeno no
                 // se pisa. En ambos casos la entrega se confirma.
-                Self::ack_and_log(&ctx, &conn, &msg_id, &item.document_id).await;
+                metrics::counter!("worker_documents_total", "outcome" => "completed").increment(1);
+                Self::ack_and_log(&ctx, &conn, &msg_id, &item).await;
             }
             Err(e) => {
                 // Compensacion (S2-P3-09): borrar el .txt y dejar el documento
                 // en PROCESSING para el reconciliador. El mensaje queda
                 // pendiente y se reclamara de nuevo.
-                eprintln!(
-                    "documento {}: el cierre en Mongo fallo ({e}); se compensa el .txt y queda pendiente",
-                    item.document_id
+                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "el cierre en Mongo fallo; se compensa el .txt y queda pendiente",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    error = %e
                 );
                 match ctx.pipeline.compensate(&item).await {
-                    Ok(()) => eprintln!(
-                        "documento {}: .txt compensado (0 huerfanos)",
-                        item.document_id
-                    ),
-                    Err(ce) => eprintln!(
-                        "documento {}: la compensacion del .txt fallo ({ce}); revisar el bucket",
-                        item.document_id
-                    ),
+                    Ok(()) => {
+                        metrics::counter!("worker_compensations_total", "result" => "ok")
+                            .increment(1);
+                        info!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "txt compensado (0 huerfanos)",
+                            correlation_id = %item.correlation_id,
+                            document_id = %item.document_id
+                        );
+                    }
+                    Err(ce) => {
+                        metrics::counter!("worker_compensations_total", "result" => "error")
+                            .increment(1);
+                        warn!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "la compensacion del txt fallo; revisar el bucket",
+                            correlation_id = %item.correlation_id,
+                            document_id = %item.document_id,
+                            error = %ce
+                        );
+                    }
                 }
             }
         }
@@ -456,12 +623,21 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         ctx: &JobContext<S, K>,
         conn: &MultiplexedConnection,
         msg_id: &str,
-        document_id: &str,
+        item: &WorkItem,
     ) {
         match Self::ack(ctx, conn, msg_id).await {
-            Ok(()) => eprintln!("documento {document_id} completado y ACK-eado"),
-            Err(e) => eprintln!(
-                "documento {document_id} procesado pero el XACK fallo ({e}): queda pendiente y se reprocesara (put idempotente)"
+            Ok(()) => info!(
+                service = crate::telemetry::SERVICE,
+                msg = "documento completado y ACK-eado",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id
+            ),
+            Err(e) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "procesado pero el XACK fallo; queda pendiente y se reprocesa (put idempotente)",
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                error = %e
             ),
         }
     }
@@ -544,9 +720,10 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             Self::spawn_job(ctx, sem, conn, jobs, entry.id, fields);
         }
         if !reply.deleted_ids.is_empty() {
-            eprintln!(
-                "xautoclaim: {} mensajes ya no existen en el stream",
-                reply.deleted_ids.len()
+            info!(
+                service = crate::telemetry::SERVICE,
+                msg = "xautoclaim: mensajes ya no existen en el stream",
+                deleted = reply.deleted_ids.len()
             );
         }
         Ok(())
@@ -634,16 +811,33 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         )
         .await
         {
-            Ok(true) => eprintln!(
-                "documento {} movido a DLQ ({error_code}: {error_message})",
-                item.document_id
+            Ok(true) => {
+                metrics::counter!("worker_dlq_total", "cause" => error_code.to_string())
+                    .increment(1);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "documento movido a la DLQ",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    cause = %error_code,
+                    error = %error_message
+                );
+            }
+            Ok(false) => info!(
+                service = crate::telemetry::SERVICE,
+                msg = "mensaje ya no pendiente; DLQ omitida (idempotente)",
+                msg_id = %msg_id,
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id
             ),
-            Ok(false) => {
-                eprintln!("mensaje {msg_id} ya no esta pendiente: DLQ omitida (idempotente)")
-            }
-            Err(e) => {
-                eprintln!("DLQ fallo para {msg_id}: {e}; queda pendiente para reintento");
-            }
+            Err(e) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "DLQ fallo; el mensaje queda pendiente para reintento",
+                msg_id = %msg_id,
+                correlation_id = %item.correlation_id,
+                document_id = %item.document_id,
+                error = %e
+            ),
         }
     }
 }

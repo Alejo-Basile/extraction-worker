@@ -63,6 +63,7 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         mongo_timeout: Duration::from_secs(2),
         max_pages: 2000,
         max_output_bytes: 1024 * 1024,
+        metrics_interval: std::time::Duration::from_secs(15),
     }
 }
 
