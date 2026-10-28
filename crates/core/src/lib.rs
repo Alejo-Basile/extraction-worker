@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod fake;
+pub mod status;
 
 /// Version del esquema del contrato JSON (seccion 11.3).
 /// Un worker que no entiende la version NO procesa el mensaje: va a la DLQ
@@ -37,6 +38,10 @@ pub mod error_code {
     pub const PDF_NO_TEXT: &str = "PDF_NO_TEXT";
     /// El objeto supera `WORKER_MAX_PDF_BYTES` (defensa en profundidad).
     pub const PDF_TOO_LARGE: &str = "PDF_TOO_LARGE";
+    /// El PDF supera `WORKER_MAX_PAGES` (defensa ante PDF hostil).
+    pub const PDF_TOO_MANY_PAGES: &str = "PDF_TOO_MANY_PAGES";
+    /// El texto extraido supera `WORKER_MAX_OUTPUT_BYTES`.
+    pub const PDF_OUTPUT_TOO_LARGE: &str = "PDF_OUTPUT_TOO_LARGE";
 }
 
 /// Mensaje en la DLQ (seccion 11.3). Anade el diagnostico al mensaje original;

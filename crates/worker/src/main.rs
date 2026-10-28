@@ -39,12 +39,39 @@ async fn main() -> std::io::Result<()> {
     }
     let port = http_port().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt)
+    let cfg = ConsumerConfig::from_env();
+    let pipeline = extraction_worker::consumer::pipeline::ExtractionPipeline::from_env(&cfg)
+        .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
+    // F3b: cliente Mongo con rol acotado (ADR-0006); sin MONGO_WORKER_URI
+    // valido el worker no arranca.
+    let documents = extraction_worker::document_store::DocumentStore::connect(&cfg.mongo_config())
+        .await
+        .map_err(|e| std::io::Error::other(format!("configuracion Mongo invalida: {e}")))?;
+    let documents = std::sync::Arc::new(documents);
+    // /readyz real: Redis + MinIO + Mongo (DoD global punto 5).
+    let s3 = extraction_worker::objects::S3Config {
+        endpoint: cfg.s3_endpoint.clone(),
+        bucket_raw: cfg.s3_bucket_raw.clone(),
+        bucket_txt: cfg.s3_bucket_txt.clone(),
+        access_key: cfg.s3_access_key.clone(),
+        secret_key: cfg.s3_secret_key.clone(),
+    };
+    let minio = extraction_worker::objects::ObjectStoreSource::new(&s3)
+        .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
+    let readiness = std::sync::Arc::new(
+        http::Readiness::new(&cfg.redis_url, minio, documents.clone())
+            .map_err(std::io::Error::other)?,
+    );
+    let runner = ConsumerRunner::new(cfg, std::sync::Arc::new(pipeline), documents);
+
     let prometheus = telemetry::prometheus_handle()
         .map_err(|e| std::io::Error::other(format!("no se pudo instalar el recorder: {e}")))?;
 
     let server = HttpServer::new(move || {
         App::new()
             .app_data(actix_web::web::Data::new(prometheus.clone()))
+            .app_data(actix_web::web::Data::new(readiness.clone()))
             .wrap(middleware::from_fn(http::track_http_metrics))
             .service(http::healthz)
             .service(http::readyz)
@@ -60,11 +87,6 @@ async fn main() -> std::io::Result<()> {
     // F1: arrancar consumer con CancellationToken (S1-P3-02/03)
     let token = CancellationToken::new();
     let token_consumer = token.clone();
-    let cfg = ConsumerConfig::from_env();
-    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt)
-    let pipeline = extraction_worker::consumer::pipeline::ExtractionPipeline::from_env(&cfg)
-        .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
-    let runner = ConsumerRunner::new(cfg, std::sync::Arc::new(pipeline));
     let consumer_handle = tokio::spawn(async move {
         if let Err(e) = runner.run(token_consumer).await {
             eprintln!("consumer finalizado con error: {e}");

@@ -44,32 +44,61 @@ services:
       retries: 12
 
   mongo:
-    # Replica Set rs0: requisito del Change Stream del relay (S1-P2-06) y
-    # del readConcern majority. Se prepara aqui para F3b (S2-P3-08/09).
+    # Replica Set rs0 con autenticacion (requisito del Change Stream del
+    # relay, S1-P2-06; y del rol acotado del worker, ADR-0006). El usuario
+    # root se crea al primer arranque via MONGO_INITDB_* (volumen vacio).
     image: mongo:7
-    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    # rs0 + auth exige keyfile (regla de MongoDB). Se genera al primer
+    # arranque dentro del volumen y se re-entra al entrypoint oficial para
+    # que MONGO_INITDB_* cree el root.
+    command: >
+      bash -c '
+      if [ ! -f /data/db/keyfile ]; then openssl rand -base64 75 > /data/db/keyfile; fi;
+      chmod 400 /data/db/keyfile;
+      exec docker-entrypoint.sh mongod --replSet rs0 --auth --keyFile /data/db/keyfile --bind_ip_all
+      '
     ports:
       - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
     volumes:
       - mongo-data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { 0 }"]
+      test: ["CMD-SHELL", "mongosh --quiet -u root -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'try { rs.status().ok } catch (e) { 0 }'"]
       interval: 5s
       timeout: 3s
       retries: 24
 
   mongo-init:
+    # rs.initiate + coleccion documents + rol del worker con SOLO update
+    # sobre documents (ADR-0006), via root. Idempotente: tolera rs0 ya
+    # iniciado y coleccion/rol/usuario ya creados.
     image: mongo:7
     depends_on:
       mongo:
         condition: service_started
+    environment:
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_WORKER_PASSWORD: ${MONGO_WORKER_PASSWORD}
     restart: "no"
     entrypoint: >
       bash -c '
       for i in $$(seq 1 30); do
-        mongosh --host mongo --quiet --eval "rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"mongo:27017\"}]})" && echo "rs0 iniciado" && break;
+        mongosh --host mongo -u root -p "$$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "try { rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"mongo:27017\"}]}) } catch (e) { print(e.message) }" && break;
         sleep 2;
-      done
+      done;
+      for i in $$(seq 1 30); do
+        mongosh --host mongo -u root -p "$$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "try { db.hello().isWritablePrimary } catch (e) { false }" | grep -q true && echo "primario listo" && break;
+        sleep 2;
+      done;
+      mongosh --host mongo -u root -p "$$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "
+        const app = db.getSiblingDB(\"app\");
+        try { app.createCollection(\"documents\") } catch (e) { print(\"col: \" + e.message) }
+        try { app.createRole({role: \"workerUpdateDocuments\", privileges: [{resource: {db: \"app\", collection: \"documents\"}, actions: [\"update\"]}], roles: []}) } catch (e) { print(\"role: \" + e.message) }
+        try { app.createUser({user: \"worker\", pwd: \"$$MONGO_WORKER_PASSWORD\", roles: [{role: \"workerUpdateDocuments\", db: \"app\"}]}) } catch (e) { print(\"user: \" + e.message) }
+        print(\"mongo init listo\");
+      "
       '
 
 volumes:
