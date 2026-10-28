@@ -37,6 +37,34 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
 - **CI (segunda capa):** el job `gitleaks` (`.github/workflows/gitleaks.yml`)
   escanea el diff de cada PR y cada push a `main`.
 
+## Observabilidad
+
+- **`/healthz`**: el proceso está vivo (liveness, sin tocar dependencias).
+- **`/readyz`**: verifica dependencias reales en paralelo — `PING` a Redis,
+  `head` de una clave sonda en MinIO y `PING` a Mongo. Responde `200` si las
+  tres están OK y `503` con el detalle por dependencia.
+- **`/metrics`**: exposición Prometheus. Etiquetas de baja cardinalidad
+  (ruta/estado); nunca `document_id`, `correlation_id` ni `object_key`.
+- La composición `Retry → Circuit Breaker → Timeout` por dependencia, sus
+  umbrales y la taxonomía de fallos están en
+  [`docs/adr/ADR-0007-composicion-resiliencia.md`](docs/adr/ADR-0007-composicion-resiliencia.md).
+
+## Rollback / runbook
+
+- **Rollback de una versión:** desplegar de nuevo la imagen/tag anterior del
+  worker. El servicio es stateless; el estado vive en Redis, MinIO y Mongo, y
+  las transiciones de Mongo son condicionales (ADR-0006), por lo que volver a
+  una versión previa no corrompe documentos en curso.
+- **Rollback de un cambio en `main`:** `git revert <sha-del-squash-merge>` y
+  dejar que CI valide la reversión (la rama `main` está protegida; no se hace
+  push directo).
+- **Ante una dependencia caída:** revisar `/readyz` para identificar cuál
+  falla. Con el breaker abierto el worker rechaza localmente y deja los
+  mensajes pendientes en la PEL; al recuperarse la dependencia se reintentan
+  sin intervención.
+- **Mensajes trabados en la PEL:** `cargo run -- --inspect-pel` lista
+  consumidores, antigüedad y cantidad de entregas pendientes.
+
 ## Gobernanza
 
 - Rama `main` protegida por ruleset: push directo y force push denegados, PR obligatorio con CI en verde y al menos 1 aprobación del code owner (`@BenjaDiaZzZ`).
