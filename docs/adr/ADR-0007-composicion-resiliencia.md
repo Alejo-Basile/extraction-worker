@@ -69,7 +69,7 @@ flowchart TB
 | Dependencia | Retry | Circuit Breaker | Timeout por operación | Variable / constante |
 |---|---|---|---|---|
 | Redis | backoff exponencial + jitter, tope 30 s | 5 fallos consecutivos, abierto 30 s, probe único | 5 s | `REDIS_OP_TIMEOUT`, `WORKER_BLOCK_MS=5000` |
-| MinIO | backoff exponencial + jitter, tope 30 s | 5 fallos consecutivos, abierto 30 s, probe único | 60 s | `S3_OP_TIMEOUT` |
+| MinIO | backoff exponencial + jitter, tope 30 s | 5 fallos consecutivos, abierto 30 s, probe único | 60 s | `S3_OP_TIMEOUT_MS` |
 | Mongo | backoff exponencial + jitter, tope 30 s | 5 fallos consecutivos, abierto 30 s, probe único | 3000 ms | `MONGO_TIMEOUT_MS` |
 
 Además:
@@ -105,8 +105,10 @@ trabajo). Un `CircuitOpen` no consume presupuesto de reintento.
   rechazos inmediatos, lo que evita *retry storms*.
 - **Costo:** más configuración por dependencia y tres breakers por proceso.
   Es deliberado: son tres fallos distintos y se observan por separado.
-- **Comportamiento ante apagado:** el `CancellationToken` corta el bucle; el
-  mensaje en vuelo no se `XACK`-ea y queda en la PEL para `XAUTOCLAIM`.
+- **Comportamiento ante apagado:** el `CancellationToken` corta la lectura y
+  los jobs en vuelo se drenan hasta `WORKER_SHUTDOWN_DRAIN_SECS` (default 4s,
+  dentro del presupuesto global de 6s). Solo los jobs que terminan reciben
+  `XACK`; los abortados quedan en la PEL para `XAUTOCLAIM`.
 
 ## Alternativas descartadas
 

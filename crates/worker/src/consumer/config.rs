@@ -35,6 +35,11 @@ pub struct ConsumerConfig {
     pub max_output_bytes: u64,
     /// Periodo de refresco de los gauges de cola (DoD 3 / S0-P3-05).
     pub metrics_interval: Duration,
+    /// Timeout de cada operacion S3 (S2-P3-06, configurable en tests).
+    pub s3_op_timeout: Duration,
+    /// Presupuesto para terminar jobs en vuelo durante el apagado
+    /// (S4-P3-04). Debe dejar margen dentro de los 6s globales.
+    pub shutdown_drain: Duration,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -101,6 +106,16 @@ impl ConsumerConfig {
             max_output_bytes: env_u64_or("WORKER_MAX_OUTPUT_BYTES", 52_428_800),
             metrics_interval: Duration::from_secs(
                 env_u64_or("WORKER_METRICS_INTERVAL_SECS", 15).max(1),
+            ),
+            s3_op_timeout: Duration::from_millis(
+                env_u64_or(
+                    "S3_OP_TIMEOUT_MS",
+                    crate::objects::DEFAULT_S3_OP_TIMEOUT_MS,
+                )
+                .max(1),
+            ),
+            shutdown_drain: Duration::from_secs(
+                env_u64_or("WORKER_SHUTDOWN_DRAIN_SECS", 4).min(5),
             ),
         }
     }

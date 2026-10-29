@@ -53,12 +53,15 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
   `worker_dlq_total{cause}`, `worker_claim_total{result}`,
   `worker_extraction_seconds{outcome}`, `worker_compensations_total{result}`,
   `worker_inflight`, `worker_breaker_open{dependency}`,
-  `worker_stream_depth{stream}`, `worker_pel_pending{group}` y
-  `worker_shutdown_seconds`. Los gauges de cola se refrescan cada
+  `worker_stream_depth{stream}`, `worker_pel_pending{group}`,
+  `worker_s3_seconds{operation,outcome}`, `worker_shutdown_seconds` y
+  `worker_shutdown_aborted_total`. Los gauges de cola se refrescan cada
   `WORKER_METRICS_INTERVAL_SECS` (default `15`).
 - **Apagado**: `SIGTERM`/`SIGINT` cancelan el consumer y drenan HTTP y consumer
-  en paralelo con un presupuesto único de 6s; los mensajes en vuelo quedan en
-  la PEL para que otro worker los reclame.
+  en paralelo con un presupuesto único de 6s. Los jobs en vuelo tienen
+  `WORKER_SHUTDOWN_DRAIN_SECS` (default `4`, máximo `5`) para terminar y
+  `XACK`-ear; los que no terminan se abortan sin `XACK` y quedan en la PEL
+  para que otro worker los reclame con `XAUTOCLAIM`.
 - La composición `Retry → Circuit Breaker → Timeout` por dependencia, sus
   umbrales y la taxonomía de fallos están en
   [`docs/adr/ADR-0007-composicion-resiliencia.md`](docs/adr/ADR-0007-composicion-resiliencia.md).

@@ -88,12 +88,22 @@ pub fn txt_key(document_id: &str) -> String {
     format!("{document_id}.txt")
 }
 
+/// Topes del pipeline agrupados para no crecer la firma de `new`.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineLimits {
+    pub job_timeout: Duration,
+    pub s3_op_timeout: Duration,
+    pub max_pdf_bytes: u64,
+    pub max_output_bytes: u64,
+}
+
 pub struct ExtractionPipeline<S: ObjectSource, K: TextSink> {
     source: Arc<S>,
     sink: Arc<K>,
     extractor: Arc<dyn TextExtractor>,
     breaker: Arc<CircuitBreaker>,
     job_timeout: Duration,
+    s3_op_timeout: Duration,
     max_pdf_bytes: u64,
     /// Tope del texto extraido antes del PUT (§11.5).
     max_output_bytes: u64,
@@ -105,18 +115,17 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         sink: Arc<K>,
         extractor: Arc<dyn TextExtractor>,
         breaker: Arc<CircuitBreaker>,
-        job_timeout: Duration,
-        max_pdf_bytes: u64,
-        max_output_bytes: u64,
+        limits: PipelineLimits,
     ) -> Self {
         Self {
             source,
             sink,
             extractor,
             breaker,
-            job_timeout,
-            max_pdf_bytes,
-            max_output_bytes,
+            job_timeout: limits.job_timeout,
+            s3_op_timeout: limits.s3_op_timeout,
+            max_pdf_bytes: limits.max_pdf_bytes,
+            max_output_bytes: limits.max_output_bytes,
         }
     }
     /// Breaker de MinIO, expuesto para el gauge `worker_breaker_open`.
@@ -188,19 +197,26 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
     }
 
     async fn download(&self, key: &str, temp: &TempPdf) -> Result<u64, Failure> {
+        let started = std::time::Instant::now();
         let source = self.source.clone();
         let dest = temp.path().to_path_buf();
         let max = self.max_pdf_bytes;
         let key = key.to_string();
-        with_retry_cb(&self.breaker, || {
+        let op_timeout = self.s3_op_timeout;
+        let result = with_retry_cb(&self.breaker, || {
             let source = source.clone();
             let key = key.clone();
             let dest = dest.clone();
             async move {
-                with_s3_timeout(|| async { source.download_to(&key, max, &dest).await }).await
+                with_s3_timeout(op_timeout, || async {
+                    source.download_to(&key, max, &dest).await
+                })
+                .await
             }
         })
-        .await
+        .await;
+        record_s3("download", started, &result);
+        result
     }
 
     async fn extract(&self, temp: &TempPdf) -> Result<String, Failure> {
@@ -219,16 +235,22 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
     }
 
     async fn upload(&self, key: &str, text: &str) -> Result<(), Failure> {
+        let started = std::time::Instant::now();
         let sink = self.sink.clone();
         let key = key.to_string();
         let text = text.to_string();
-        with_retry_cb(&self.breaker, || {
+        let op_timeout = self.s3_op_timeout;
+        let result = with_retry_cb(&self.breaker, || {
             let sink = sink.clone();
             let key = key.clone();
             let text = text.clone();
-            async move { with_s3_timeout(|| async { sink.put_text(&key, &text).await }).await }
+            async move {
+                with_s3_timeout(op_timeout, || async { sink.put_text(&key, &text).await }).await
+            }
         })
-        .await
+        .await;
+        record_s3("upload", started, &result);
+        result
     }
 
     /// Compensacion del paso 5 (S2-P3-09): si el cierre en Mongo fallo tras
@@ -241,15 +263,31 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             correlation_id = %item.correlation_id,
             document_id = %item.document_id
         );
+        let started = std::time::Instant::now();
         let sink = self.sink.clone();
         let key = txt_key(&item.document_id);
-        with_retry_cb(&self.breaker, || {
+        let op_timeout = self.s3_op_timeout;
+        let result = with_retry_cb(&self.breaker, || {
             let sink = sink.clone();
             let key = key.clone();
-            async move { with_s3_timeout(|| async { sink.delete(&key).await }).await }
+            async move { with_s3_timeout(op_timeout, || async { sink.delete(&key).await }).await }
         })
-        .await
+        .await;
+        record_s3("compensate", started, &result);
+        result
     }
+}
+
+/// Histograma de latencia por operacion S3 (S5-P3-03): permite ver si MinIO
+/// se degrada aunque el job termine bien.
+fn record_s3<T>(operation: &'static str, started: std::time::Instant, result: &Result<T, Failure>) {
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    metrics::histogram!(
+        "worker_s3_seconds",
+        "operation" => operation,
+        "outcome" => outcome
+    )
+    .record(started.elapsed().as_secs_f64());
 }
 
 /// Fuente en memoria para tests del pipeline.
@@ -329,15 +367,18 @@ impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::Objec
         };
         let source = crate::objects::ObjectStoreSource::new(&s3)?;
         let sink = crate::objects::ObjectStoreSink::new(&s3)?;
-        Ok(Self {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-            extractor: Arc::new(crate::extract::PdfExtractor::new(cfg.max_pages)),
-            breaker: crate::objects::minio_breaker(),
-            job_timeout: cfg.job_timeout,
-            max_pdf_bytes: cfg.max_pdf_bytes,
-            max_output_bytes: cfg.max_output_bytes,
-        })
+        Ok(Self::new(
+            Arc::new(source),
+            Arc::new(sink),
+            Arc::new(crate::extract::PdfExtractor::new(cfg.max_pages)),
+            crate::objects::minio_breaker(),
+            PipelineLimits {
+                job_timeout: cfg.job_timeout,
+                s3_op_timeout: cfg.s3_op_timeout,
+                max_pdf_bytes: cfg.max_pdf_bytes,
+                max_output_bytes: cfg.max_output_bytes,
+            },
+        ))
     }
 }
 
@@ -370,9 +411,12 @@ mod tests {
             Arc::new(sink),
             extractor,
             Arc::new(CircuitBreaker::default()),
-            job_timeout,
-            1024 * 1024,
-            1024 * 1024,
+            PipelineLimits {
+                job_timeout,
+                s3_op_timeout: Duration::from_secs(1),
+                max_pdf_bytes: 1024 * 1024,
+                max_output_bytes: 1024 * 1024,
+            },
         )
     }
 
@@ -493,9 +537,12 @@ mod tests {
             Arc::new(InMemorySink::default()),
             Arc::new(FakeTextExtractor::returning("ok")),
             Arc::new(CircuitBreaker::default()),
-            Duration::from_secs(5),
-            1024 * 1024,
-            1024 * 1024,
+            PipelineLimits {
+                job_timeout: Duration::from_secs(5),
+                s3_op_timeout: Duration::from_secs(1),
+                max_pdf_bytes: 1024 * 1024,
+                max_output_bytes: 1024 * 1024,
+            },
         );
         let item = work_item();
         p.process(&item)

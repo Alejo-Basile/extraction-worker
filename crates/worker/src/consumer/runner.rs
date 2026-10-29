@@ -17,8 +17,10 @@
 //! sigue respondiendo con todos los permisos tomados. Las tareas esperando
 //! permiso solo retienen el payload chico del mensaje (KBs), no el PDF.
 //!
-//! Apagado: el `JoinSet` se dropea y aborta las tareas en vuelo; los
-//! mensajes sin terminar quedan pendientes y otro worker los reclama.
+//! Apagado (S4-P3-04): al cancelar se dejan de leer mensajes nuevos y se
+//! espera a los jobs en vuelo hasta `WORKER_SHUTDOWN_DRAIN_SECS`. Los que no
+//! terminan se abortan y quedan pendientes en la PEL (otro worker los
+//! reclama con `XAUTOCLAIM`); nunca se hace `XACK` de un job incompleto.
 //!
 //! Composicion de resiliencia (SDD 7.1-7.3): `Retry` envuelve al
 //! `CircuitBreaker` de Redis y, dentro del pipeline, al breaker de MinIO.
@@ -138,8 +140,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
         autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut autoclaim_cursor = "0-0".to_string();
-        // JoinSet: al drop-ear (apagado) aborta las tareas en vuelo; los
-        // mensajes sin terminar quedan pendientes y otro worker los reclama.
+        // JoinSet de extracciones en vuelo; el apagado los drena con un
+        // presupuesto acotado.
         let mut jobs: JoinSet<()> = JoinSet::new();
 
         // Gauges de cola en una conexion propia (DoD 3): no bloquean el
@@ -182,7 +184,22 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 }
             }
         }
-        drop(jobs);
+        let aborted = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
+        if aborted == 0 {
+            info!(
+                service = crate::telemetry::SERVICE,
+                msg = "apagado: jobs en vuelo drenados",
+                budget_secs = ctx.cfg.shutdown_drain.as_secs()
+            );
+        } else {
+            metrics::counter!("worker_shutdown_aborted_total").increment(aborted as u64);
+            warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "apagado: jobs abortados; quedan en la PEL para XAUTOCLAIM",
+                aborted,
+                budget_secs = ctx.cfg.shutdown_drain.as_secs()
+            );
+        }
         let _ = metrics.await;
         Ok(())
     }
@@ -842,9 +859,87 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     }
 }
 
+/// Espera a que terminen los jobs en vuelo hasta `budget`; al agotarse los
+/// aborta. Devuelve cuantos quedaron abortados. Los mensajes de los abortados
+/// siguen pendientes en la PEL: no se ACK-ean ni se pierden.
+pub(crate) async fn drain_jobs(jobs: &mut JoinSet<()>, budget: Duration) -> usize {
+    let started = std::time::Instant::now();
+    while !jobs.is_empty() {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            while jobs.try_join_next().is_some() {}
+            let aborted = jobs.len();
+            jobs.abort_all();
+            while jobs.join_next().await.is_some() {}
+            return aborted;
+        }
+        match timeout(remaining, jobs.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return 0,
+            Err(_) => {}
+        }
+    }
+    0
+}
+
 /// Reloj del worker para `updated_at`/`completed_at`/`status_history.at`.
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn drain_espera_los_cortos_y_aborta_los_largos() {
+        let mut jobs: JoinSet<()> = JoinSet::new();
+        jobs.spawn(async {
+            sleep(Duration::from_millis(30)).await;
+        });
+        jobs.spawn(async {
+            sleep(Duration::from_secs(60)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let aborted = drain_jobs(&mut jobs, Duration::from_millis(500)).await;
+
+        assert_eq!(aborted, 1, "solo el job largo debe abortarse");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "el drenaje no debe esperar al job largo"
+        );
+        assert!(jobs.is_empty(), "el JoinSet debe quedar consumido");
+    }
+
+    #[tokio::test]
+    async fn drain_sin_presupuesto_aborta_todo() {
+        let mut jobs: JoinSet<()> = JoinSet::new();
+        jobs.spawn(async {
+            sleep(Duration::from_millis(10)).await;
+        });
+        jobs.spawn(async {
+            sleep(Duration::from_secs(60)).await;
+        });
+
+        let aborted = drain_jobs(&mut jobs, Duration::ZERO).await;
+        assert_eq!(aborted, 2);
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_con_todos_los_jobs_cortos_no_aborta() {
+        let mut jobs: JoinSet<()> = JoinSet::new();
+        for _ in 0..3 {
+            jobs.spawn(async {
+                sleep(Duration::from_millis(10)).await;
+            });
+        }
+        let aborted = drain_jobs(&mut jobs, Duration::from_secs(1)).await;
+        assert_eq!(aborted, 0);
+        assert!(jobs.is_empty());
+    }
 }

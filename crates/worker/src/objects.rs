@@ -17,9 +17,10 @@ use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::consumer::resilience::{CircuitBreaker, Failure};
 
-/// Timeout de cada operacion S3 individual (S2-P3-06). El timeout del job
-/// completo lo aplica el pipeline con `WORKER_JOB_TIMEOUT_SECS`.
-const S3_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Timeout por defecto de cada operacion S3 individual (S2-P3-06).
+/// Configurable con `S3_OP_TIMEOUT_MS`; el timeout del job completo lo
+/// aplica el pipeline con `WORKER_JOB_TIMEOUT_SECS`.
+pub const DEFAULT_S3_OP_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -176,14 +177,20 @@ pub async fn put_text(store: &Arc<dyn ObjectStore>, key: &str, text: &str) -> Re
 }
 
 /// Ejecuta `op` con timeout por operacion; el CB de MinIO lo maneja el caller.
-pub async fn with_s3_timeout<T, F, Fut>(op: F) -> Result<T, Failure>
+pub async fn with_s3_timeout<T, F, Fut>(
+    op_timeout: std::time::Duration,
+    op: F,
+) -> Result<T, Failure>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, Failure>>,
 {
-    match tokio::time::timeout(S3_OP_TIMEOUT, op()).await {
+    match tokio::time::timeout(op_timeout, op()).await {
         Ok(r) => r,
-        Err(_) => Err(Failure::transient("S3_TIMEOUT", "operacion s3 timeout")),
+        Err(_) => Err(Failure::transient(
+            "S3_TIMEOUT",
+            format!("operacion s3 timeout tras {op_timeout:?}"),
+        )),
     }
 }
 

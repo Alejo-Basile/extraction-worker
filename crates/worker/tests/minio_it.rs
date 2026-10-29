@@ -128,6 +128,8 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         max_pages: 2000,
         max_output_bytes: 1024 * 1024,
         metrics_interval: std::time::Duration::from_secs(15),
+        s3_op_timeout: std::time::Duration::from_secs(5),
+        shutdown_drain: std::time::Duration::from_secs(1),
     };
     let pipeline = must(ExtractionPipeline::from_env(&cfg));
     let item = extraction_core::WorkItem {
