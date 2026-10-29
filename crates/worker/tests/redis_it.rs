@@ -64,6 +64,8 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         max_pages: 2000,
         max_output_bytes: 1024 * 1024,
         metrics_interval: std::time::Duration::from_secs(15),
+        s3_op_timeout: std::time::Duration::from_secs(5),
+        shutdown_drain: std::time::Duration::from_secs(1),
     }
 }
 
