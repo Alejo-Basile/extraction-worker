@@ -14,7 +14,9 @@ pub mod config;
 pub mod dlq;
 pub mod group;
 pub mod pipeline;
+pub mod replay;
 pub mod resilience;
 pub mod runner;
 
-pub use cli::inspect_pel as cli_inspect_pel;
+pub use cli::{inspect_dlq as cli_inspect_dlq, inspect_pel as cli_inspect_pel};
+pub use replay::replay_dlq as cli_replay_dlq;

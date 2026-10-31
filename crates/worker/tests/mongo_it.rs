@@ -252,5 +252,50 @@ async fn readyz_del_stack_completo_responde_ok() {
     }
 }
 
+#[tokio::test]
+#[ignore]
+async fn replay_prepara_solo_estados_reclamables() {
+    let root = root_client().await;
+    let store = must(DocumentStore::connect(&worker_config()).await);
+
+    let processing = new_id("replay-processing");
+    seed(&root, &processing, "PROCESSING").await;
+    assert!(must(
+        store.prepare_replay(&processing, &processing, NOW).await
+    ));
+    let after = read_document(&root, &processing).await;
+    assert_eq!(after.get_str("status").ok(), Some("RETRYING"));
+    let history = after
+        .get_array("status_history")
+        .unwrap_or_else(|e| panic!("debe haber status_history: {e}"));
+    assert_eq!(history.len(), 1);
+    let event = history[0]
+        .as_document()
+        .unwrap_or_else(|| panic!("la historia debe ser un documento"));
+    assert_eq!(event.get_str("actor").ok(), Some("operator"));
+    assert_eq!(event.get_str("status").ok(), Some("RETRYING"));
+
+    let queued = new_id("replay-queued");
+    seed(&root, &queued, "QUEUED").await;
+    assert!(must(store.prepare_replay(&queued, &queued, NOW).await));
+    let after = read_document(&root, &queued).await;
+    assert_eq!(after.get_str("status").ok(), Some("QUEUED"));
+    let history_len = match after.get_array("status_history") {
+        Ok(h) => h.len(),
+        Err(e) => panic!("status_history debe ser un array: {e}"),
+    };
+    assert_eq!(history_len, 0);
+
+    let failed = new_id("replay-failed");
+    seed(&root, &failed, "FAILED").await;
+    assert!(!must(store.prepare_replay(&failed, &failed, NOW).await));
+    let after = read_document(&root, &failed).await;
+    assert_eq!(after.get_str("status").ok(), Some("FAILED"));
+
+    delete_document(&root, &processing).await;
+    delete_document(&root, &queued).await;
+    delete_document(&root, &failed).await;
+}
+
 #[allow(dead_code)]
 fn _status_usado(_s: DocumentStatus) {}

@@ -24,6 +24,7 @@ use mongodb::{Client, Collection};
 use crate::consumer::resilience::{CircuitBreaker, Failure};
 
 pub const WORKER_ACTOR: &str = "worker";
+pub const OPERATOR_ACTOR: &str = "operator";
 const COLLECTION_DOCUMENTS: &str = "documents";
 
 #[derive(Debug, Clone)]
@@ -139,6 +140,62 @@ impl DocumentStore {
         Ok(res.matched_count > 0)
     }
 
+    /// Prepara un documento para replay de la DLQ (S4-P3-01):
+    /// `PROCESSING -> RETRYING` (transicion declarada) o confirma que ya
+    /// esta en un estado reclamable (`QUEUED`/`RETRYING`). Devuelve `false`
+    /// si el documento esta en un estado terminal/desconocido: el replay
+    /// automatico no lo toca.
+    pub async fn prepare_replay(
+        &self,
+        document_id: &str,
+        correlation_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, Failure> {
+        let history = status_event_with_actor(
+            DocumentStatus::Retrying,
+            now_rfc3339,
+            correlation_id,
+            OPERATOR_ACTOR,
+        );
+        let res = self
+            .documents
+            .update_one(
+                doc! {
+                    "_id": document_id,
+                    "status": DocumentStatus::Processing.as_str(),
+                },
+                doc! {
+                    "$set": {
+                        "status": DocumentStatus::Retrying.as_str(),
+                        "updated_at": now_rfc3339,
+                    },
+                    "$push": {"status_history": history},
+                },
+            )
+            .await
+            .map_err(mongo_failure)?;
+        if res.matched_count > 0 {
+            return Ok(true);
+        }
+
+        let claimable: Vec<&str> = DocumentStatus::claimable_from()
+            .iter()
+            .map(DocumentStatus::as_str)
+            .collect();
+        let res = self
+            .documents
+            .update_one(
+                doc! {
+                    "_id": document_id,
+                    "status": {"$in": claimable},
+                },
+                doc! {"$set": {"updated_at": now_rfc3339}},
+            )
+            .await
+            .map_err(mongo_failure)?;
+        Ok(res.matched_count > 0)
+    }
+
     fn breaker() -> Arc<CircuitBreaker> {
         Arc::new(CircuitBreaker::default())
     }
@@ -163,10 +220,19 @@ fn mongo_failure(e: mongodb::error::Error) -> Failure {
 /// Entrada de `status_history` con los mismos campos que `StatusEvent`
 /// (status, at, actor, correlation_id).
 fn status_event(status: DocumentStatus, now_rfc3339: &str, correlation_id: &str) -> BsonDocument {
+    status_event_with_actor(status, now_rfc3339, correlation_id, WORKER_ACTOR)
+}
+
+fn status_event_with_actor(
+    status: DocumentStatus,
+    now_rfc3339: &str,
+    correlation_id: &str,
+    actor: &str,
+) -> BsonDocument {
     doc! {
         "status": status.as_str(),
         "at": now_rfc3339,
-        "actor": WORKER_ACTOR,
+        "actor": actor,
         "correlation_id": correlation_id,
     }
 }

@@ -40,6 +40,13 @@ pub struct ConsumerConfig {
     /// Presupuesto para terminar jobs en vuelo durante el apagado
     /// (S4-P3-04). Debe dejar margen dentro de los 6s globales.
     pub shutdown_drain: Duration,
+    /// Stream de auditoria de replays de la DLQ (S4-P3-01).
+    pub dlq_replay_audit_stream: String,
+    /// Hash de DLQ ids ya replayeados: evita reemitir dos veces.
+    pub dlq_replayed_key: String,
+    /// Antiguedad a partir de la cual un consumidor con pendientes se
+    /// considera sin senal de vida (S6-P3-01).
+    pub dead_consumer_ms: u64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -117,6 +124,15 @@ impl ConsumerConfig {
             shutdown_drain: Duration::from_secs(
                 env_u64_or("WORKER_SHUTDOWN_DRAIN_SECS", 4).min(5),
             ),
+            dlq_replay_audit_stream: env_or(
+                "REDIS_DLQ_REPLAY_AUDIT_STREAM",
+                "stream:pdf-processing-dlq-replay",
+            ),
+            dlq_replayed_key: env_or(
+                "REDIS_DLQ_REPLAYED_KEY",
+                "stream:pdf-processing-dlq-replayed",
+            ),
+            dead_consumer_ms: env_u64_or("WORKER_DEAD_CONSUMER_MS", min_idle_ms),
         }
     }
 }

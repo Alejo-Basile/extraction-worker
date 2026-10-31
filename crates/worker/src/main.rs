@@ -37,6 +37,12 @@ fn http_port() -> Result<u16, String> {
 async fn main() -> std::io::Result<()> {
     telemetry::init_logging();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--replay-dlq") {
+        return extraction_worker::consumer::cli_replay_dlq(&args).await;
+    }
+    if args.iter().any(|a| a == "--inspect-dlq") {
+        return extraction_worker::consumer::cli_inspect_dlq(&args).await;
+    }
     if args.iter().any(|a| a == "--inspect-pel") {
         return extraction_worker::consumer::cli_inspect_pel().await;
     }
