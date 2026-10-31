@@ -54,9 +54,10 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
   `worker_extraction_seconds{outcome}`, `worker_compensations_total{result}`,
   `worker_inflight`, `worker_breaker_open{dependency}`,
   `worker_stream_depth{stream}`, `worker_pel_pending{group}`,
-  `worker_s3_seconds{operation,outcome}`, `worker_shutdown_seconds` y
-  `worker_shutdown_aborted_total`. Los gauges de cola se refrescan cada
-  `WORKER_METRICS_INTERVAL_SECS` (default `15`).
+  `worker_dlq_depth{stream}`, `worker_dlq_oldest_age_seconds{stream}`,
+  `worker_dead_consumers{group}`, `worker_s3_seconds{operation,outcome}`,
+  `worker_shutdown_seconds` y `worker_shutdown_aborted_total`. Los gauges de
+  cola se refrescan cada `WORKER_METRICS_INTERVAL_SECS` (default `15`).
 - **Apagado**: `SIGTERM`/`SIGINT` cancelan el consumer y drenan HTTP y consumer
   en paralelo con un presupuesto único de 6s. Los jobs en vuelo tienen
   `WORKER_SHUTDOWN_DRAIN_SECS` (default `4`, máximo `5`) para terminar y
@@ -80,7 +81,26 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
   mensajes pendientes en la PEL; al recuperarse la dependencia se reintentan
   sin intervención.
 - **Mensajes trabados en la PEL:** `cargo run -- --inspect-pel` lista
-  consumidores, antigüedad y cantidad de entregas pendientes.
+  consumidores, antigüedad, cantidad de entregas y `document_id`/
+  `correlation_id` de cada mensaje. El gauge `worker_dead_consumers` y el log
+  `consumidor con pendientes sin senal de vida` avisan de consumidores
+  inactivos (umbral `WORKER_DEAD_CONSUMER_MS`, default `WORKER_MIN_IDLE_MS`).
+- **DLQ con mensajes:** `cargo run -- --inspect-dlq` muestra profundidad,
+  antigüedad de la entrada más vieja y los campos de cada mensaje. Para
+  reemitir de forma controlada:
+  `cargo run -- --replay-dlq --document-id <id> --dry-run` y luego sin
+  `--dry-run`. Se puede acotar por `--error-code`, `--limit` o `--all`; el
+  operador queda en `--by` (default `$USER`).
+- **Semántica del replay:** antes de reemitir, un documento `PROCESSING` pasa
+  a `RETRYING` (transición declarada) con actor `operator`; `QUEUED`/
+  `RETRYING` se dejan como están. `FAILED`/`REJECTED` y documentos
+  inexistentes no se replayean automáticamente: quedan para triage manual.
+  El Lua es atómico (XADD + XDEL + idempotencia + auditoría) y un DLQ id ya
+  replayeado no se duplica. La auditoría queda en
+  `REDIS_DLQ_REPLAY_AUDIT_STREAM` y los ids vistos en
+  `REDIS_DLQ_REPLAYED_KEY`. Si Redis falla después del reset de Mongo, la
+  entrada sigue en la DLQ y el documento queda `RETRYING`: repetir el replay
+  lo recupera.
 
 ## Gobernanza
 

@@ -251,6 +251,53 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             metrics::gauge!("worker_pel_pending", "group" => ctx.cfg.group.clone())
                 .set(pending as f64);
         }
+        if let Some(stats) = Self::dlq_stats(ctx, conn).await {
+            metrics::gauge!("worker_dlq_depth", "stream" => ctx.cfg.dlq_stream.clone())
+                .set(stats.depth as f64);
+            metrics::gauge!(
+                "worker_dlq_oldest_age_seconds",
+                "stream" => ctx.cfg.dlq_stream.clone()
+            )
+            .set(stats.oldest_age_secs.unwrap_or(0) as f64);
+        }
+        if let Some(dead) = Self::dead_consumers(ctx, conn).await {
+            metrics::gauge!("worker_dead_consumers", "group" => ctx.cfg.group.clone())
+                .set(dead.len() as f64);
+            for consumer in dead {
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "consumidor con pendientes sin senal de vida",
+                    consumer = %consumer.name,
+                    pending = consumer.pending,
+                    idle_ms = consumer.idle,
+                    group = %ctx.cfg.group
+                );
+            }
+        }
+    }
+
+    async fn dlq_stats(
+        ctx: &JobContext<S, K>,
+        conn: &MultiplexedConnection,
+    ) -> Option<dlq::DlqStats> {
+        let mut c = conn.clone();
+        let cfg = ctx.cfg.clone();
+        match timeout(REDIS_OP_TIMEOUT, dlq::stats(&mut c, &cfg)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    async fn dead_consumers(
+        ctx: &JobContext<S, K>,
+        conn: &MultiplexedConnection,
+    ) -> Option<Vec<redis::streams::StreamInfoConsumer>> {
+        let mut c = conn.clone();
+        let cfg = ctx.cfg.clone();
+        match timeout(REDIS_OP_TIMEOUT, group::dead_consumers(&mut c, &cfg)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
+        }
     }
 
     async fn stream_depth(ctx: &JobContext<S, K>, conn: &MultiplexedConnection) -> Option<u64> {

@@ -66,6 +66,9 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         metrics_interval: std::time::Duration::from_secs(15),
         s3_op_timeout: std::time::Duration::from_secs(5),
         shutdown_drain: std::time::Duration::from_secs(1),
+        dlq_replay_audit_stream: format!("{stream}-dlq-replay"),
+        dlq_replayed_key: format!("{stream}-dlq-replayed"),
+        dead_consumer_ms: 10,
     }
 }
 

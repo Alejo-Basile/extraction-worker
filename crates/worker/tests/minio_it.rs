@@ -130,6 +130,9 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         metrics_interval: std::time::Duration::from_secs(15),
         s3_op_timeout: std::time::Duration::from_secs(5),
         shutdown_drain: std::time::Duration::from_secs(1),
+        dlq_replay_audit_stream: "stream:pdf-processing-dlq-replay".to_string(),
+        dlq_replayed_key: "stream:pdf-processing-dlq-replayed".to_string(),
+        dead_consumer_ms: 10,
     };
     let pipeline = must(ExtractionPipeline::from_env(&cfg));
     let item = extraction_core::WorkItem {

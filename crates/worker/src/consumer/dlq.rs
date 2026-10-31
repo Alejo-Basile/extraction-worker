@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use extraction_core::{error_code, DlqMessage, ErrorKind, WorkItem};
 use redis::aio::MultiplexedConnection;
-use redis::streams::StreamPendingCountReply;
+use redis::streams::{StreamPendingCountReply, StreamRangeReply};
 use redis::AsyncCommands;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -39,6 +39,20 @@ impl From<DlqError> for Failure {
             DlqError::Serialize(s) => Failure::fatal("DLQ_SERIALIZE", s),
         }
     }
+}
+
+/// Entrada cruda de la DLQ para inspeccion y replay.
+#[derive(Debug, Clone)]
+pub struct DlqEntry {
+    pub id: String,
+    pub fields: HashMap<String, String>,
+}
+
+/// Metricas de tamano/antiguedad de la DLQ (S4-P3-02).
+#[derive(Debug, Clone, Copy)]
+pub struct DlqStats {
+    pub depth: u64,
+    pub oldest_age_secs: Option<u64>,
 }
 
 const DLQ_LUA: &str = r#"
@@ -125,6 +139,68 @@ pub async fn move_to_dlq_with_cause(
 
     let moved: i64 = cmd.query_async(conn).await?;
     Ok(moved > 0)
+}
+
+/// Lee hasta `count` entradas de la DLQ (XRANGE), en orden de insercion.
+pub async fn read_entries(
+    conn: &mut MultiplexedConnection,
+    cfg: &ConsumerConfig,
+    count: usize,
+) -> Result<Vec<DlqEntry>, DlqError> {
+    read_entries_from(conn, cfg, "-", count).await
+}
+
+/// Lee hasta `count` entradas desde `start` (inclusive; usar `(id` para
+/// excluirlo). Permite paginar la DLQ sin cargarla completa.
+pub async fn read_entries_from(
+    conn: &mut MultiplexedConnection,
+    cfg: &ConsumerConfig,
+    start: &str,
+    count: usize,
+) -> Result<Vec<DlqEntry>, DlqError> {
+    let reply: StreamRangeReply = conn
+        .xrange_count(&cfg.dlq_stream, start, "+", count)
+        .await?;
+    Ok(reply
+        .ids
+        .into_iter()
+        .map(|entry| DlqEntry {
+            id: entry.id,
+            fields: entry
+                .map
+                .into_iter()
+                .filter_map(|(k, v)| redis::from_redis_value::<String>(v).ok().map(|s| (k, s)))
+                .collect(),
+        })
+        .collect())
+}
+
+/// Profundidad y antiguedad de la entrada mas vieja de la DLQ.
+pub async fn stats(
+    conn: &mut MultiplexedConnection,
+    cfg: &ConsumerConfig,
+) -> Result<DlqStats, DlqError> {
+    let depth: u64 = conn.xlen(&cfg.dlq_stream).await?;
+    let oldest: StreamRangeReply = conn.xrange_count(&cfg.dlq_stream, "-", "+", 1).await?;
+    let oldest_age_secs = oldest
+        .ids
+        .first()
+        .and_then(|entry| stream_id_millis(&entry.id))
+        .map(|ms| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            now.saturating_sub(ms) / 1000
+        });
+    Ok(DlqStats {
+        depth,
+        oldest_age_secs,
+    })
+}
+
+fn stream_id_millis(id: &str) -> Option<u64> {
+    id.split('-').next()?.parse().ok()
 }
 
 /// Delivery count (intentos) del mensaje `msg_id`, via `XPENDING` del id

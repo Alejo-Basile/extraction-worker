@@ -83,7 +83,8 @@ pub struct StatusEvent {
     pub status: DocumentStatus,
     /// RFC 3339 del momento de la transicion.
     pub at: String,
-    /// `worker` | `doc-service` | `reconciler` | `client` | `minio-webhook`.
+    /// `worker` | `doc-service` | `reconciler` | `client` | `minio-webhook`
+    /// | `operator` (replay manual de la DLQ).
     pub actor: String,
     pub correlation_id: String,
 }
