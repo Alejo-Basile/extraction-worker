@@ -85,7 +85,13 @@ async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(move || {
         App::new()
             .app_data(actix_web::web::Data::new(prometheus.clone()))
-            .app_data(actix_web::web::Data::new(readiness.clone()))
+            // `readiness` es `Arc<Readiness>`: `Data::new` registraría
+            // `Data<Arc<Readiness>>` y el extractor de `readyz`, que pide
+            // `Data<Readiness>`, fallaria con 500 en cada request (medido:
+            // /readyz respondia 500 con el stack sano, mientras los tests
+            // pasaban porque registran el tipo concreto). `Data::from(Arc<T>)`
+            // registra `Data<T>`, que es lo que el handler espera.
+            .app_data(actix_web::web::Data::from(readiness.clone()))
             .wrap(middleware::from_fn(http::track_http_metrics))
             .service(http::healthz)
             .service(http::readyz)
