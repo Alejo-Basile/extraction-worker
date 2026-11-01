@@ -1,0 +1,23 @@
+# Contexto de build de la imagen de produccion (S5-P4-01).
+# target/ pesa cientos de MB y no aporta nada a un build multi-stage.
+target/
+**/*.rs.bk
+
+# Historial y metadata de git: no se necesitan dentro de la imagen.
+.git/
+.github/
+
+# Entornos locales y secretos: nunca deben entrar al contexto de build.
+*.env
+.env
+*_secret*.txt
+*.pem
+*.key
+*.crt
+
+# Material de desarrollo que no compila la imagen.
+labs/
+docs/
+tests/
+deny.toml
+*.md
