@@ -35,7 +35,7 @@ use extraction_core::{ErrorKind, WorkItem};
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands};
+use redis::{aio::MultiplexedConnection, AsyncCommands, AsyncConnectionConfig};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -146,7 +146,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // breaker abria a los ~15s y el worker moria.
         let read_conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            r = Self::connect(ctx, &client) => r?,
+            r = Self::connect_read(ctx, &client) => r?,
         };
 
         let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
@@ -338,6 +338,38 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) -> Result<MultiplexedConnection, RunnerError> {
         with_retry_cb(&ctx.redis_breaker, || async {
             match timeout(REDIS_OP_TIMEOUT, client.get_multiplexed_async_connection()).await {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(classify_redis_error(&e)),
+                Err(_) => Err(Failure::transient(
+                    REDIS_TIMEOUT_CODE,
+                    "redis connect timeout",
+                )),
+            }
+        })
+        .await
+        .map_err(RunnerError::from)
+    }
+
+    /// Conexion EXCLUSIVA para el read bloqueante.
+    ///
+    /// Ademas de estar separada de la compartida, tiene que desactivar el
+    /// `response_timeout`: el default de redis-rs es 500 ms
+    /// (`DEFAULT_RESPONSE_TIMEOUT`), y un `XREADGROUP ... BLOCK 5000` lo supera
+    /// siempre, devolviendo `REDIS_IO: timed out`. Ese timeout, reintentado,
+    /// es lo que abria el breaker a los ~15 s. La duracion del read ya esta
+    /// acotada por `timeout(block_ms + 2000)` en `read_batch`.
+    async fn connect_read(
+        ctx: &JobContext<S, K>,
+        client: &redis::Client,
+    ) -> Result<MultiplexedConnection, RunnerError> {
+        let cfg = AsyncConnectionConfig::new().set_response_timeout(None);
+        with_retry_cb(&ctx.redis_breaker, || async {
+            match timeout(
+                REDIS_OP_TIMEOUT,
+                client.get_multiplexed_async_connection_with_config(&cfg),
+            )
+            .await
+            {
                 Ok(Ok(c)) => Ok(c),
                 Ok(Err(e)) => Err(classify_redis_error(&e)),
                 Err(_) => Err(Failure::transient(
