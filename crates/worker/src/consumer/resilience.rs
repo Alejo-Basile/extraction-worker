@@ -14,6 +14,8 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tracing::warn;
+
 /// Clasificacion de un fallo en el pipeline del consumer (S2-P3-02/07).
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -183,6 +185,16 @@ where
                 if e.counts_for_breaker() {
                     cb.on_failure();
                 }
+                // Sin este log, el unico sintoma visible es el `CircuitOpen`
+                // final, que esconde cual fue el error real del primer
+                // intento. Fue exactamente lo que impidio diagnosticar el
+                // head-of-line del XREADGROUP bloqueante.
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "operacion fallo; evaluando reintento",
+                    error = %e,
+                    retryable = e.is_retryable()
+                );
                 if !e.is_retryable() {
                     return Err(e);
                 }

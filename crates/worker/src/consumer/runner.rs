@@ -137,6 +137,18 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             Err(_) => return Err(RunnerError::Config("ensure_group timeout".to_string())),
         }
 
+        // El read bloqueante (XREADGROUP BLOCK) va por una conexion PROPIA.
+        // Sobre una conexion multiplexada compartida, mientras el BLOCK espera,
+        // cualquier otra operacion (gauges, XPENDING del delivery count,
+        // XAUTOCLAIM) queda encolada detras en el mismo socket; si tarda mas
+        // que REDIS_OP_TIMEOUT expira, se reintenta, agota el umbral del
+        // breaker y el consumidor deja de leer. Medido: con BLOCK=5000 el
+        // breaker abria a los ~15s y el worker moria.
+        let read_conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = Self::connect(ctx, &client) => r?,
+        };
+
         let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
         autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut autoclaim_cursor = "0-0".to_string();
@@ -165,7 +177,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         );
                     }
                 }
-                res = Self::read_batch(ctx, &conn) => {
+                res = Self::read_batch(ctx, &read_conn) => {
                     match res {
                         Ok(batch) => {
                             for (id, fields) in batch {
