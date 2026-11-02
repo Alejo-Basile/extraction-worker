@@ -306,9 +306,7 @@ async fn read_bloqueante_no_encola_operaciones_de_otra_conexion() {
     let mut admin = get_conn().await;
     let stream = format!("it:worker:hol:{}:{}", std::process::id(), now_millis());
     let cfg = test_cfg(&stream);
-    group::ensure_group(&mut admin, &cfg)
-        .await
-        .expect("ensure_group");
+    must(group::ensure_group(&mut admin, &cfg).await);
 
     let client = must(redis::Client::open(cfg.redis_url.as_str()));
 
@@ -329,13 +327,13 @@ async fn read_bloqueante_no_encola_operaciones_de_otra_conexion() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
     let start = std::time::Instant::now();
-    let probe: StreamPendingCountReply = ops
-        .xpending_count(&cfg.stream, &cfg.group, "-", "+", 10)
-        .await
-        .expect("xpending en conexion dedicada");
+    let probe: StreamPendingCountReply = must(
+        ops.xpending_count(&cfg.stream, &cfg.group, "-", "+", 10)
+            .await,
+    );
     drop(probe);
     let dedicated = start.elapsed();
-    blocking.await.unwrap();
+    must(blocking.await);
 
     // --- Caso malo (el que el fix evita): mismo socket compartido ---
     let mut shared_a = must(client.get_multiplexed_async_connection().await);
@@ -358,7 +356,7 @@ async fn read_bloqueante_no_encola_operaciones_de_otra_conexion() {
         .xpending_count(&cfg.stream, &cfg.group, "-", "+", 10)
         .await;
     let shared = start.elapsed();
-    blocking_shared.await.unwrap();
+    must(blocking_shared.await);
 
     assert!(
         dedicated < Duration::from_millis(500),
