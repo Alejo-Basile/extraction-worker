@@ -36,7 +36,7 @@ use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands, AsyncConnectionConfig};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +68,11 @@ pub enum RunnerError {
 /// Timeout duro de cada operacion Redis individual (S2-P3-06). Las lecturas
 /// bloqueantes llevan su propio margen sobre `block_ms`.
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Capacidad del canal reader -> bucle principal. Acotada a proposito: si el
+/// bucle principal se atrasa, el reader aplica contrapresion en vez de acumular
+/// trabajo en memoria.
+const READ_QUEUE: usize = 32;
 const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
 
 /// Contexto clonable que lleva cada tarea de procesamiento. La conexion se
@@ -149,9 +154,6 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             r = Self::connect_read(ctx, &client) => r?,
         };
 
-        let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
-        autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut autoclaim_cursor = "0-0".to_string();
         // JoinSet de extracciones en vuelo; el apagado los drena con un
         // presupuesto acotado.
         let mut jobs: JoinSet<()> = JoinSet::new();
@@ -165,37 +167,52 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             token.clone(),
         ));
 
+        // El reader vive en su PROPIA tarea. Con el read dentro de un
+        // `select!`, cualquier otro branch que gane la carrera dropea la
+        // future en vuelo, y redis-rs NO cancela el comando del lado del
+        // servidor (multiplexed_connection.rs:537-546): el mensaje ya
+        // entregado por Redis queda en la PEL sin job y sin XACK. Medido: 1 de
+        // 4 mensajes entregado y ACKeado sin procesar.
+        let (tx, mut rx) = mpsc::channel::<Vec<(String, HashMap<String, String>)>>(READ_QUEUE);
+        let reader = tokio::spawn(Self::reader_loop(
+            ctx.clone(),
+            read_conn,
+            tx.clone(),
+            token.clone(),
+        ));
+
+        // XAUTOCLAIM fuera del camino del read, con su propia conexion y su
+        // propio tick: era justamente el otro branch que cancelaba el read.
+        let autoclaim_conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = Self::connect(ctx, &client) => r?,
+        };
+        let autoclaim = tokio::spawn(Self::autoclaim_loop(
+            ctx.clone(),
+            autoclaim_conn,
+            self.sem.clone(),
+            token.clone(),
+        ));
+
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = autoclaim_ticker.tick() => {
-                    if let Err(e) = Self::do_autoclaim(ctx, &conn, &mut autoclaim_cursor, &self.sem, &mut jobs).await {
-                        warn!(
-                            service = crate::telemetry::SERVICE,
-                            msg = "xautoclaim fallo",
-                            error = %e
-                        );
-                    }
-                }
-                res = Self::read_batch(ctx, &read_conn) => {
-                    match res {
-                        Ok(batch) => {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(batch) => {
                             for (id, fields) in batch {
                                 Self::spawn_job(ctx, &self.sem, &conn, &mut jobs, id, fields);
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                service = crate::telemetry::SERVICE,
-                                msg = "lectura del stream fallo; reintentando",
-                                error = %e
-                            );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
+                        // El reader termino: no va a llegar mas trabajo.
+                        None => break,
                     }
                 }
+                Some(_) = jobs.join_next() => {}
             }
         }
+        let _ = reader.await;
+        let _ = autoclaim.await;
         let aborted = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
         if aborted == 0 {
             info!(
@@ -218,6 +235,71 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     /// Refresca gauges de cola y de estado interno cada
     /// `WORKER_METRICS_INTERVAL_SECS` (default 15s).
+    /// Lee del stream en su propia tarea.
+    ///
+    /// Es la pieza que evita la perdida: al no estar dentro de un `select!`,
+    /// ningun otro branch puede cancelar un `XREADGROUP` en vuelo. Si la
+    /// lectura falla, se registra y se reintenta con una pausa corta.
+    async fn reader_loop(
+        ctx: JobContext<S, K>,
+        read_conn: MultiplexedConnection,
+        tx: mpsc::Sender<Vec<(String, HashMap<String, String>)>>,
+        token: CancellationToken,
+    ) {
+        while !token.is_cancelled() {
+            match Self::read_batch(&ctx, &read_conn).await {
+                Ok(batch) => {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    if tx.send(batch).await.is_err() {
+                        // El bucle principal ya no escucha: apagado.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "lectura del stream fallo; reintentando",
+                        error = %e
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    /// Recupera mensajes huerfanos con `XAUTOCLAIM`, en su propia tarea: su
+    /// tick ya no compite con el read, asi que no lo cancela. Mantiene su
+    /// propio `JoinSet` para poder drenarlo en el apagado.
+    async fn autoclaim_loop(
+        ctx: JobContext<S, K>,
+        conn: MultiplexedConnection,
+        sem: Arc<Semaphore>,
+        token: CancellationToken,
+    ) {
+        let mut ticker = interval(ctx.cfg.xautoclaim_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut cursor = "0-0".to_string();
+        let mut jobs: JoinSet<()> = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(e) = Self::do_autoclaim(&ctx, &conn, &mut cursor, &sem, &mut jobs).await {
+                        warn!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "xautoclaim fallo",
+                            error = %e
+                        );
+                    }
+                }
+                Some(_) = jobs.join_next() => {}
+            }
+        }
+        let _ = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
+    }
+
     async fn metrics_loop(
         ctx: JobContext<S, K>,
         conn: MultiplexedConnection,
