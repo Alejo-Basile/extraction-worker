@@ -690,6 +690,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         code = %code,
                         error = %message
                     );
+                    Self::mark_retrying(&ctx, &item).await;
                 }
                 Failure::CircuitOpen => {
                     metrics::counter!("worker_documents_total", "outcome" => "deferred")
@@ -700,6 +701,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         correlation_id = %item.correlation_id,
                         document_id = %item.document_id
                     );
+                    Self::mark_retrying(&ctx, &item).await;
                 }
             }
             return;
@@ -828,6 +830,46 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 correlation_id = %item.correlation_id,
                 document_id = %item.document_id,
                 error = %e
+            ),
+        }
+    }
+
+    /// Marca `PROCESSING -> RETRYING` cuando un fallo transitorio difiere el
+    /// trabajo. Es la transicion declarada por la que el documento pasa antes de
+    /// que, agotados los reintentos, `RETRYING -> EXTRACTION_FAILED` sea legal
+    /// (SPEC 4 y 5.4). Sin esto el documento queda en `PROCESSING` para siempre.
+    /// Best-effort: si no matchea o falla, el mensaje sigue pendiente y el
+    /// reconciliador cubre el caso.
+    async fn mark_retrying(ctx: &JobContext<S, K>, item: &WorkItem) {
+        match timeout(
+            ctx.cfg.mongo_timeout,
+            ctx.documents.mark_terminal(
+                &item.document_id,
+                extraction_core::status::DocumentStatus::Processing,
+                extraction_core::status::DocumentStatus::Retrying,
+                "transient_failure_deferred",
+                &item.correlation_id,
+                &now_rfc3339(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "RETRYING no aplicado: el documento ya no estaba en PROCESSING",
+                document_id = %item.document_id
+            ),
+            Ok(Err(e)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "no se pudo marcar RETRYING; el mensaje sigue pendiente",
+                document_id = %item.document_id,
+                error = %e
+            ),
+            Err(_) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "timeout marcando RETRYING; el mensaje sigue pendiente",
+                document_id = %item.document_id
             ),
         }
     }
@@ -1012,6 +1054,55 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     cause = %error_code,
                     error = %error_message
                 );
+
+                // SPEC 5.4 y 6.3: la mudanza a la DLQ cierra el ciclo del
+                // documento. `Business` (entrada no procesable) cierra desde
+                // PROCESSING a REJECTED; `Transient` (reintentos agotados)
+                // cierra desde RETRYING a EXTRACTION_FAILED, que dispara la
+                // compensacion de la SAGA. Ambas son transiciones declaradas.
+                let (expected, target) = match error_kind {
+                    ErrorKind::Business => (
+                        extraction_core::status::DocumentStatus::Processing,
+                        extraction_core::status::DocumentStatus::Rejected,
+                    ),
+                    ErrorKind::Transient => (
+                        extraction_core::status::DocumentStatus::Retrying,
+                        extraction_core::status::DocumentStatus::ExtractionFailed,
+                    ),
+                };
+                match timeout(
+                    ctx.cfg.mongo_timeout,
+                    ctx.documents.mark_terminal(
+                        &item.document_id,
+                        expected,
+                        target,
+                        error_code,
+                        &item.correlation_id,
+                        &now_rfc3339(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "estado terminal no aplicado: el documento ya no estaba en el estado esperado",
+                        document_id = %item.document_id,
+                        expected = expected.as_str(),
+                        target = target.as_str()
+                    ),
+                    Ok(Err(e)) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "no se pudo escribir el estado terminal; queda para el reconciliador",
+                        document_id = %item.document_id,
+                        error = %e
+                    ),
+                    Err(_) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "timeout escribiendo el estado terminal; queda para el reconciliador",
+                        document_id = %item.document_id
+                    ),
+                }
             }
             Ok(false) => info!(
                 service = crate::telemetry::SERVICE,
