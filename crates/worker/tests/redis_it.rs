@@ -287,3 +287,89 @@ async fn inspeccion_de_pel_muestra_consumidor_y_antiguedad() {
 
     cleanup(&mut conn, &cfg).await;
 }
+
+/// El read bloqueante no puede compartir la conexion multiplexada con el
+/// resto de las operaciones.
+///
+/// Sobre un `MultiplexedConnection` compartido, mientras `XREADGROUP BLOCK`
+/// espera, cualquier otra operacion queda encolada en el mismo socket y
+/// puede expirar contra `REDIS_OP_TIMEOUT`; esos timeouts agotan el umbral
+/// del breaker y el consumidor deja de leer (defecto medido: con
+/// `WORKER_BLOCK_MS=5000` el breaker abria a los ~15 s).
+///
+/// Este test pina las dos caras del mecanismo:
+/// - conexion DEDICADA   -> la operacion concurrente responde de inmediato;
+/// - conexion COMPARTIDA -> la operacion concurrente espera al BLOCK.
+#[tokio::test]
+#[ignore]
+async fn read_bloqueante_no_encola_operaciones_de_otra_conexion() {
+    let mut admin = get_conn().await;
+    let stream = format!("it:worker:hol:{}:{}", std::process::id(), now_millis());
+    let cfg = test_cfg(&stream);
+    must(group::ensure_group(&mut admin, &cfg).await);
+
+    let client = must(redis::Client::open(cfg.redis_url.as_str()));
+
+    // --- Caso bueno: conexion dedicada para el read bloqueante ---
+    let mut reader = must(client.get_multiplexed_async_connection().await);
+    let mut ops = must(client.get_multiplexed_async_connection().await);
+    let group = cfg.group.clone();
+    let stream_a = cfg.stream.clone();
+    let blocking = tokio::spawn(async move {
+        let opts = StreamReadOptions::default()
+            .group(&group, "it-hol-reader")
+            .count(1)
+            .block(1500);
+        let _: StreamReadReply = reader
+            .xread_options(&[stream_a.as_str()], &[">".to_string()], &opts)
+            .await
+            .unwrap_or_default();
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let start = std::time::Instant::now();
+    let probe: StreamPendingCountReply = must(
+        ops.xpending_count(&cfg.stream, &cfg.group, "-", "+", 10)
+            .await,
+    );
+    drop(probe);
+    let dedicated = start.elapsed();
+    must(blocking.await);
+
+    // --- Caso malo (el que el fix evita): mismo socket compartido ---
+    let mut shared_a = must(client.get_multiplexed_async_connection().await);
+    let mut shared_b = shared_a.clone();
+    let group = cfg.group.clone();
+    let stream_b = cfg.stream.clone();
+    let blocking_shared = tokio::spawn(async move {
+        let opts = StreamReadOptions::default()
+            .group(&group, "it-hol-shared")
+            .count(1)
+            .block(1200);
+        let _: StreamReadReply = shared_a
+            .xread_options(&[stream_b.as_str()], &[">".to_string()], &opts)
+            .await
+            .unwrap_or_default();
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let start = std::time::Instant::now();
+    let shared_probe: Result<StreamPendingCountReply, _> = shared_b
+        .xpending_count(&cfg.stream, &cfg.group, "-", "+", 10)
+        .await;
+    let shared = start.elapsed();
+    must(blocking_shared.await);
+
+    assert!(
+        dedicated < Duration::from_millis(500),
+        "con conexion dedicada la operacion tardo {dedicated:?}: el read bloqueante la esta encolando"
+    );
+    // Sobre el mismo socket la operacion NO puede completar rapido: o queda
+    // encolada hasta que termina el BLOCK, o falla por timeout. Las dos cosas
+    // son el defecto que el fix evita.
+    assert!(
+        shared_probe.is_err() || shared >= Duration::from_millis(500),
+        "el escenario compartido deberia quedar encolado o fallar (tardo {shared:?}, ok={}); si no, el test dejo de reproducir el defecto",
+        shared_probe.is_ok()
+    );
+
+    cleanup(&mut admin, &cfg).await;
+}

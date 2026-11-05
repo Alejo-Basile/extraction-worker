@@ -35,8 +35,8 @@ use extraction_core::{ErrorKind, WorkItem};
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use redis::{aio::MultiplexedConnection, AsyncCommands, AsyncConnectionConfig};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +68,11 @@ pub enum RunnerError {
 /// Timeout duro de cada operacion Redis individual (S2-P3-06). Las lecturas
 /// bloqueantes llevan su propio margen sobre `block_ms`.
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Capacidad del canal reader -> bucle principal. Acotada a proposito: si el
+/// bucle principal se atrasa, el reader aplica contrapresion en vez de acumular
+/// trabajo en memoria.
+const READ_QUEUE: usize = 32;
 const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
 
 /// Contexto clonable que lleva cada tarea de procesamiento. La conexion se
@@ -137,9 +142,18 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             Err(_) => return Err(RunnerError::Config("ensure_group timeout".to_string())),
         }
 
-        let mut autoclaim_ticker = interval(ctx.cfg.xautoclaim_interval);
-        autoclaim_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut autoclaim_cursor = "0-0".to_string();
+        // El read bloqueante (XREADGROUP BLOCK) va por una conexion PROPIA.
+        // Sobre una conexion multiplexada compartida, mientras el BLOCK espera,
+        // cualquier otra operacion (gauges, XPENDING del delivery count,
+        // XAUTOCLAIM) queda encolada detras en el mismo socket; si tarda mas
+        // que REDIS_OP_TIMEOUT expira, se reintenta, agota el umbral del
+        // breaker y el consumidor deja de leer. Medido: con BLOCK=5000 el
+        // breaker abria a los ~15s y el worker moria.
+        let read_conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = Self::connect_read(ctx, &client) => r?,
+        };
+
         // JoinSet de extracciones en vuelo; el apagado los drena con un
         // presupuesto acotado.
         let mut jobs: JoinSet<()> = JoinSet::new();
@@ -153,37 +167,52 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             token.clone(),
         ));
 
+        // El reader vive en su PROPIA tarea. Con el read dentro de un
+        // `select!`, cualquier otro branch que gane la carrera dropea la
+        // future en vuelo, y redis-rs NO cancela el comando del lado del
+        // servidor (multiplexed_connection.rs:537-546): el mensaje ya
+        // entregado por Redis queda en la PEL sin job y sin XACK. Medido: 1 de
+        // 4 mensajes entregado y ACKeado sin procesar.
+        let (tx, mut rx) = mpsc::channel::<Vec<(String, HashMap<String, String>)>>(READ_QUEUE);
+        let reader = tokio::spawn(Self::reader_loop(
+            ctx.clone(),
+            read_conn,
+            tx.clone(),
+            token.clone(),
+        ));
+
+        // XAUTOCLAIM fuera del camino del read, con su propia conexion y su
+        // propio tick: era justamente el otro branch que cancelaba el read.
+        let autoclaim_conn = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            r = Self::connect(ctx, &client) => r?,
+        };
+        let autoclaim = tokio::spawn(Self::autoclaim_loop(
+            ctx.clone(),
+            autoclaim_conn,
+            self.sem.clone(),
+            token.clone(),
+        ));
+
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = autoclaim_ticker.tick() => {
-                    if let Err(e) = Self::do_autoclaim(ctx, &conn, &mut autoclaim_cursor, &self.sem, &mut jobs).await {
-                        warn!(
-                            service = crate::telemetry::SERVICE,
-                            msg = "xautoclaim fallo",
-                            error = %e
-                        );
-                    }
-                }
-                res = Self::read_batch(ctx, &conn) => {
-                    match res {
-                        Ok(batch) => {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(batch) => {
                             for (id, fields) in batch {
                                 Self::spawn_job(ctx, &self.sem, &conn, &mut jobs, id, fields);
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                service = crate::telemetry::SERVICE,
-                                msg = "lectura del stream fallo; reintentando",
-                                error = %e
-                            );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
+                        // El reader termino: no va a llegar mas trabajo.
+                        None => break,
                     }
                 }
+                Some(_) = jobs.join_next() => {}
             }
         }
+        let _ = reader.await;
+        let _ = autoclaim.await;
         let aborted = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
         if aborted == 0 {
             info!(
@@ -206,6 +235,71 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     /// Refresca gauges de cola y de estado interno cada
     /// `WORKER_METRICS_INTERVAL_SECS` (default 15s).
+    /// Lee del stream en su propia tarea.
+    ///
+    /// Es la pieza que evita la perdida: al no estar dentro de un `select!`,
+    /// ningun otro branch puede cancelar un `XREADGROUP` en vuelo. Si la
+    /// lectura falla, se registra y se reintenta con una pausa corta.
+    async fn reader_loop(
+        ctx: JobContext<S, K>,
+        read_conn: MultiplexedConnection,
+        tx: mpsc::Sender<Vec<(String, HashMap<String, String>)>>,
+        token: CancellationToken,
+    ) {
+        while !token.is_cancelled() {
+            match Self::read_batch(&ctx, &read_conn).await {
+                Ok(batch) => {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    if tx.send(batch).await.is_err() {
+                        // El bucle principal ya no escucha: apagado.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "lectura del stream fallo; reintentando",
+                        error = %e
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    /// Recupera mensajes huerfanos con `XAUTOCLAIM`, en su propia tarea: su
+    /// tick ya no compite con el read, asi que no lo cancela. Mantiene su
+    /// propio `JoinSet` para poder drenarlo en el apagado.
+    async fn autoclaim_loop(
+        ctx: JobContext<S, K>,
+        conn: MultiplexedConnection,
+        sem: Arc<Semaphore>,
+        token: CancellationToken,
+    ) {
+        let mut ticker = interval(ctx.cfg.xautoclaim_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut cursor = "0-0".to_string();
+        let mut jobs: JoinSet<()> = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(e) = Self::do_autoclaim(&ctx, &conn, &mut cursor, &sem, &mut jobs).await {
+                        warn!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "xautoclaim fallo",
+                            error = %e
+                        );
+                    }
+                }
+                Some(_) = jobs.join_next() => {}
+            }
+        }
+        let _ = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
+    }
+
     async fn metrics_loop(
         ctx: JobContext<S, K>,
         conn: MultiplexedConnection,
@@ -326,6 +420,38 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) -> Result<MultiplexedConnection, RunnerError> {
         with_retry_cb(&ctx.redis_breaker, || async {
             match timeout(REDIS_OP_TIMEOUT, client.get_multiplexed_async_connection()).await {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(classify_redis_error(&e)),
+                Err(_) => Err(Failure::transient(
+                    REDIS_TIMEOUT_CODE,
+                    "redis connect timeout",
+                )),
+            }
+        })
+        .await
+        .map_err(RunnerError::from)
+    }
+
+    /// Conexion EXCLUSIVA para el read bloqueante.
+    ///
+    /// Ademas de estar separada de la compartida, tiene que desactivar el
+    /// `response_timeout`: el default de redis-rs es 500 ms
+    /// (`DEFAULT_RESPONSE_TIMEOUT`), y un `XREADGROUP ... BLOCK 5000` lo supera
+    /// siempre, devolviendo `REDIS_IO: timed out`. Ese timeout, reintentado,
+    /// es lo que abria el breaker a los ~15 s. La duracion del read ya esta
+    /// acotada por `timeout(block_ms + 2000)` en `read_batch`.
+    async fn connect_read(
+        ctx: &JobContext<S, K>,
+        client: &redis::Client,
+    ) -> Result<MultiplexedConnection, RunnerError> {
+        let cfg = AsyncConnectionConfig::new().set_response_timeout(None);
+        with_retry_cb(&ctx.redis_breaker, || async {
+            match timeout(
+                REDIS_OP_TIMEOUT,
+                client.get_multiplexed_async_connection_with_config(&cfg),
+            )
+            .await
+            {
                 Ok(Ok(c)) => Ok(c),
                 Ok(Err(e)) => Err(classify_redis_error(&e)),
                 Err(_) => Err(Failure::transient(
@@ -564,6 +690,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         code = %code,
                         error = %message
                     );
+                    Self::mark_retrying(&ctx, &item).await;
                 }
                 Failure::CircuitOpen => {
                     metrics::counter!("worker_documents_total", "outcome" => "deferred")
@@ -574,6 +701,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         correlation_id = %item.correlation_id,
                         document_id = %item.document_id
                     );
+                    Self::mark_retrying(&ctx, &item).await;
                 }
             }
             return;
@@ -702,6 +830,46 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 correlation_id = %item.correlation_id,
                 document_id = %item.document_id,
                 error = %e
+            ),
+        }
+    }
+
+    /// Marca `PROCESSING -> RETRYING` cuando un fallo transitorio difiere el
+    /// trabajo. Es la transicion declarada por la que el documento pasa antes de
+    /// que, agotados los reintentos, `RETRYING -> EXTRACTION_FAILED` sea legal
+    /// (SPEC 4 y 5.4). Sin esto el documento queda en `PROCESSING` para siempre.
+    /// Best-effort: si no matchea o falla, el mensaje sigue pendiente y el
+    /// reconciliador cubre el caso.
+    async fn mark_retrying(ctx: &JobContext<S, K>, item: &WorkItem) {
+        match timeout(
+            ctx.cfg.mongo_timeout,
+            ctx.documents.mark_terminal(
+                &item.document_id,
+                extraction_core::status::DocumentStatus::Processing,
+                extraction_core::status::DocumentStatus::Retrying,
+                "transient_failure_deferred",
+                &item.correlation_id,
+                &now_rfc3339(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "RETRYING no aplicado: el documento ya no estaba en PROCESSING",
+                document_id = %item.document_id
+            ),
+            Ok(Err(e)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "no se pudo marcar RETRYING; el mensaje sigue pendiente",
+                document_id = %item.document_id,
+                error = %e
+            ),
+            Err(_) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "timeout marcando RETRYING; el mensaje sigue pendiente",
+                document_id = %item.document_id
             ),
         }
     }
@@ -886,6 +1054,55 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     cause = %error_code,
                     error = %error_message
                 );
+
+                // SPEC 5.4 y 6.3: la mudanza a la DLQ cierra el ciclo del
+                // documento. `Business` (entrada no procesable) cierra desde
+                // PROCESSING a REJECTED; `Transient` (reintentos agotados)
+                // cierra desde RETRYING a EXTRACTION_FAILED, que dispara la
+                // compensacion de la SAGA. Ambas son transiciones declaradas.
+                let (expected, target) = match error_kind {
+                    ErrorKind::Business => (
+                        extraction_core::status::DocumentStatus::Processing,
+                        extraction_core::status::DocumentStatus::Rejected,
+                    ),
+                    ErrorKind::Transient => (
+                        extraction_core::status::DocumentStatus::Retrying,
+                        extraction_core::status::DocumentStatus::ExtractionFailed,
+                    ),
+                };
+                match timeout(
+                    ctx.cfg.mongo_timeout,
+                    ctx.documents.mark_terminal(
+                        &item.document_id,
+                        expected,
+                        target,
+                        error_code,
+                        &item.correlation_id,
+                        &now_rfc3339(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "estado terminal no aplicado: el documento ya no estaba en el estado esperado",
+                        document_id = %item.document_id,
+                        expected = expected.as_str(),
+                        target = target.as_str()
+                    ),
+                    Ok(Err(e)) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "no se pudo escribir el estado terminal; queda para el reconciliador",
+                        document_id = %item.document_id,
+                        error = %e
+                    ),
+                    Err(_) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "timeout escribiendo el estado terminal; queda para el reconciliador",
+                        document_id = %item.document_id
+                    ),
+                }
             }
             Ok(false) => info!(
                 service = crate::telemetry::SERVICE,

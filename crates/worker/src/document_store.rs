@@ -140,6 +140,51 @@ impl DocumentStore {
         Ok(res.matched_count > 0)
     }
 
+    /// Aplica una transicion CONDICIONAL del ciclo de vida (SPEC 4, ADR-0006).
+    ///
+    /// Solo escribe si el documento sigue en `expected`: si otro escritor ya lo
+    /// movio, devuelve `false` y no pisa nada. Una transicion no declarada se
+    /// rechaza como bug en vez de corregirse (tabla de la seccion 11.1).
+    pub async fn mark_terminal(
+        &self,
+        document_id: &str,
+        expected: DocumentStatus,
+        target: DocumentStatus,
+        cause: &str,
+        correlation_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, Failure> {
+        if !expected.can_transition_to(target) {
+            return Err(Failure::fatal(
+                "CONTRACT_TRANSITION",
+                format!(
+                    "transicion no declarada: {} -> {}",
+                    expected.as_str(),
+                    target.as_str()
+                ),
+            ));
+        }
+        let history = status_event(target, now_rfc3339, correlation_id);
+        let filter = doc! {
+            "_id": document_id,
+            "status": expected.as_str(),
+        };
+        let update = doc! {
+            "$set": {
+                "status": target.as_str(),
+                "error_cause": cause,
+                "updated_at": now_rfc3339,
+            },
+            "$push": {"status_history": history},
+        };
+        let res = self
+            .documents
+            .update_one(filter, update)
+            .await
+            .map_err(mongo_failure)?;
+        Ok(res.matched_count > 0)
+    }
+
     /// Prepara un documento para replay de la DLQ (S4-P3-01):
     /// `PROCESSING -> RETRYING` (transicion declarada) o confirma que ya
     /// esta en un estado reclamable (`QUEUED`/`RETRYING`). Devuelve `false`
