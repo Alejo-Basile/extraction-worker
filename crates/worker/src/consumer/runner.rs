@@ -634,6 +634,16 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         match Self::claim(&ctx, &item).await {
             Ok(true) => {
                 metrics::counter!("worker_claim_total", "result" => "claimed").increment(1);
+                info!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "documento reclamado",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    msg_id = %msg_id,
+                    consumer = %cfg.consumer_name,
+                    attempts,
+                    min_idle_ms = cfg.min_idle_ms
+                );
             }
             Ok(false) => {
                 metrics::counter!("worker_claim_total", "result" => "not_claimable").increment(1);
@@ -642,7 +652,10 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     service = crate::telemetry::SERVICE,
                     msg = "documento no reclamable; entrega duplicada, se ACK-ea",
                     correlation_id = %item.correlation_id,
-                    document_id = %item.document_id
+                    document_id = %item.document_id,
+                    msg_id = %msg_id,
+                    consumer = %cfg.consumer_name,
+                    attempts
                 );
                 Self::ack_and_log(&ctx, &conn, &msg_id, &item).await;
                 return;

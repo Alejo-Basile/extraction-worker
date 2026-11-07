@@ -63,9 +63,18 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
   `WORKER_SHUTDOWN_DRAIN_SECS` (default `4`, máximo `5`) para terminar y
   `XACK`-ear; los que no terminan se abortan sin `XACK` y quedan en la PEL
   para que otro worker los reclame con `XAUTOCLAIM`.
+- **Calibración de `XAUTOCLAIM`**: `WORKER_MIN_IDLE_MS` se calcula como
+  `WORKER_JOB_TIMEOUT_SECS * 2000 + 1000` (2x el timeout duro del job más 1s).
+  Los logs `documento reclamado` / `documento no reclamable` incluyen
+  `msg_id`, `consumer` y `attempts`, y las extracciones registran
+  `duration_ms`, para verificar que un job vivo no le roba el mensaje a otra
+  instancia.
 - La composición `Retry → Circuit Breaker → Timeout` por dependencia, sus
   umbrales y la taxonomía de fallos están en
   [`docs/adr/ADR-0007-composicion-resiliencia.md`](docs/adr/ADR-0007-composicion-resiliencia.md).
+- El catálogo de códigos de error con significado, si son reintentables y la
+  acción operativa está en
+  [`docs/error-model.md`](docs/error-model.md).
 
 ## Rollback / runbook
 

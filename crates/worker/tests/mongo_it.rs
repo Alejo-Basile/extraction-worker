@@ -297,5 +297,82 @@ async fn replay_prepara_solo_estados_reclamables() {
     delete_document(&root, &failed).await;
 }
 
+#[tokio::test]
+#[ignore]
+async fn mark_terminal_repetido_y_no_aplicable_no_alteran() {
+    let root = root_client().await;
+    let store = must(DocumentStore::connect(&worker_config()).await);
+    let id = new_id("terminal-idempotente");
+
+    seed(&root, &id, "PROCESSING").await;
+    assert!(must(
+        store
+            .mark_terminal(
+                &id,
+                DocumentStatus::Processing,
+                DocumentStatus::Rejected,
+                "PDF_CORRUPT",
+                &id,
+                NOW
+            )
+            .await
+    ));
+    let after = read_document(&root, &id).await;
+    assert_eq!(after.get_str("status").ok(), Some("REJECTED"));
+    assert_eq!(after.get_str("error_cause").ok(), Some("PDF_CORRUPT"));
+    let history = after
+        .get_array("status_history")
+        .unwrap_or_else(|e| panic!("debe haber status_history: {e}"));
+    assert_eq!(history.len(), 1, "una sola entrada por la transicion");
+
+    // Repetir la misma mudanza: no matchea y no agrega historia.
+    let again = must(
+        store
+            .mark_terminal(
+                &id,
+                DocumentStatus::Processing,
+                DocumentStatus::Rejected,
+                "PDF_CORRUPT",
+                &id,
+                NOW,
+            )
+            .await,
+    );
+    assert!(!again, "el segundo mark_terminal no debe matchear");
+
+    // Escritura con estado de origen distinto: no altera el estado terminal.
+    let from_wrong_state = must(store.complete(&id, &format!("{id}.txt"), &id, NOW).await);
+    assert!(
+        !from_wrong_state,
+        "complete desde REJECTED no debe matchear"
+    );
+
+    // Transicion no declarada: se rechaza como bug y no pisa el estado.
+    let invalid = store
+        .mark_terminal(
+            &id,
+            DocumentStatus::Rejected,
+            DocumentStatus::Completed,
+            "no-debe-aplicarse",
+            &id,
+            NOW,
+        )
+        .await;
+    match invalid {
+        Err(Failure::Fatal { code, .. }) => assert_eq!(code, "CONTRACT_TRANSITION"),
+        other => panic!("la transicion no declarada debe ser fatal, obtuvo: {other:?}"),
+    }
+
+    let after = read_document(&root, &id).await;
+    assert_eq!(after.get_str("status").ok(), Some("REJECTED"));
+    assert_eq!(after.get_str("error_cause").ok(), Some("PDF_CORRUPT"));
+    let history = after
+        .get_array("status_history")
+        .unwrap_or_else(|e| panic!("debe haber status_history: {e}"));
+    assert_eq!(history.len(), 1, "sin entradas duplicadas ni no aplicables");
+
+    delete_document(&root, &id).await;
+}
+
 #[allow(dead_code)]
 fn _status_usado(_s: DocumentStatus) {}

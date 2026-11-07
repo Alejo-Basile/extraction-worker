@@ -176,13 +176,15 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         };
         metrics::histogram!("worker_extraction_seconds", "outcome" => outcome)
             .record(started.elapsed().as_secs_f64());
+        let duration_ms = started.elapsed().as_millis();
         match &result {
             Ok(()) => info!(
                 service = crate::telemetry::SERVICE,
                 msg = "extraccion completada",
                 correlation_id = %item.correlation_id,
                 document_id = %item.document_id,
-                outcome
+                outcome,
+                duration_ms
             ),
             Err(e) => warn!(
                 service = crate::telemetry::SERVICE,
@@ -190,6 +192,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
                 correlation_id = %item.correlation_id,
                 document_id = %item.document_id,
                 outcome,
+                duration_ms,
                 error = %e
             ),
         }
