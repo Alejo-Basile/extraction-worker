@@ -35,6 +35,8 @@ pub async fn ensure_group(
         .arg(&cfg.group)
         .arg("0")
         .arg("MKSTREAM")
+        .arg("ENTRIESREAD")
+        .arg("0")
         .query_async(conn)
         .await;
     match res {

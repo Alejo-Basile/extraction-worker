@@ -152,8 +152,10 @@ pub async fn replay_dlq(args: &[String]) -> io::Result<()> {
     let opts = ReplayOptions::from_args(args)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let cfg = ConsumerConfig::from_env();
+    // Fabrica T-07/T-08: en modo Sentinel resuelve el master vigente al
+    // invocar (comando de corta vida), en modo directo abre REDIS_URL.
     let client =
-        redis::Client::open(cfg.redis_url.as_str()).map_err(|e| io::Error::other(e.to_string()))?;
+        super::redis_conn::build_client(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut conn: MultiplexedConnection = client
         .get_multiplexed_async_connection()
         .await

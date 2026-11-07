@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extraction_core::error_code::MAX_ATTEMPTS_EXCEEDED;
@@ -35,7 +35,7 @@ use extraction_core::{ErrorKind, WorkItem};
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands, AsyncConnectionConfig};
+use redis::{aio::MultiplexedConnection, AsyncCommands};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -44,11 +44,12 @@ use tracing::{info, warn};
 
 use crate::document_store::{mongo_breaker, DocumentStore};
 
-use super::classify::classify_redis_error;
+use super::classify::{classify_redis_error, needs_reconnect};
 use super::config::ConsumerConfig;
 use super::dlq::{self, best_effort_item, contract_cause};
 use super::group;
 use super::pipeline::{ExtractionPipeline, ObjectSource, TextSink};
+use super::redis_conn::{self, RedisClient};
 use super::resilience::{with_retry_cb, CircuitBreaker, Failure};
 
 #[derive(thiserror::Error, Debug)]
@@ -75,9 +76,120 @@ const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_QUEUE: usize = 32;
 const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
 
+/// Conexion al master actual con re-resolucion ante failover (T-08).
+///
+/// Guarda el `MultiplexedConnection` vivo detras de un candado sobre un
+/// unico `Arc<RedisClient>`. Cuando una operacion falla con el marcador
+/// de failover (`REDIS_FAILOVER`: `READONLY`/`MASTERDOWN`), `run`
+/// descarta la conexion vieja, re-resuelve el master via
+/// `RedisClient::reset` y reconecta; el `with_retry_cb` envolvente
+/// reintenta la operacion sobre la conexion nueva con backoff. Los loops
+/// largos nunca crashean por un failover: es un error transitorio mas.
+struct MasterConn {
+    client: Arc<RedisClient>,
+    conn: Mutex<MultiplexedConnection>,
+    /// `true` para la conexion exclusiva del read bloqueante
+    /// (`XREADGROUP BLOCK`): se reconecta con `connect_read`.
+    read: bool,
+}
+
+impl MasterConn {
+    /// Conexion inicial con Retry+CB de Redis: corta cuando el breaker
+    /// decide o se agota el tiempo maximo de reintento (misma semantica
+    /// que el `connect` anterior).
+    async fn establish(
+        client: Arc<RedisClient>,
+        breaker: &CircuitBreaker,
+        read: bool,
+    ) -> Result<Self, Failure> {
+        let conn = with_retry_cb(breaker, || Self::connect_once(&client, read)).await?;
+        Ok(Self {
+            client,
+            conn: Mutex::new(conn),
+            read,
+        })
+    }
+
+    /// Una conexion al master vigente, con el mismo timeout duro y la
+    /// misma clasificacion que la conexion inicial.
+    async fn connect_once(
+        client: &Arc<RedisClient>,
+        read: bool,
+    ) -> Result<MultiplexedConnection, Failure> {
+        let attempt = if read {
+            timeout(REDIS_OP_TIMEOUT, client.connect_read()).await
+        } else {
+            timeout(REDIS_OP_TIMEOUT, client.connect()).await
+        };
+        match attempt {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(e)) => Err(classify_redis_error(&e)),
+            Err(_) => Err(Failure::transient(
+                REDIS_TIMEOUT_CODE,
+                "redis connect timeout",
+            )),
+        }
+    }
+
+    /// Clon de la conexion actual (los clones comparten el mismo socket).
+    fn get(&self) -> MultiplexedConnection {
+        match self.conn.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Re-resuelve el master via la fabrica (`reset`, en hilo bloqueante:
+    /// en Sentinel la fabrica hace I/O sincrona) y reemplaza la conexion
+    /// vieja por una nueva al master vigente. Si la reconexion falla, el
+    /// error sale hacia el `with_retry_cb` de `run`, que reintenta con
+    /// backoff hasta el presupuesto maximo.
+    async fn recover(&self) -> Result<(), Failure> {
+        self.client
+            .reset_async()
+            .await
+            .map_err(|e| classify_redis_error(&e))?;
+        let fresh = Self::connect_once(&self.client, self.read).await?;
+        match self.conn.lock() {
+            Ok(mut guard) => *guard = fresh,
+            Err(poisoned) => *poisoned.into_inner() = fresh,
+        }
+        Ok(())
+    }
+
+    /// Corre `op` con Retry+CB sobre la conexion actual. Si `op` falla con
+    /// una falla que exige reemplazar la conexion ([`needs_reconnect`]:
+    /// failover o socket muerto), la descarta, re-resuelve el master y
+    /// reintenta la operacion una vez sobre la conexion nueva; si el
+    /// reintento vuelve a fallar, el retry externo sigue con backoff. Los
+    /// loops nunca crashean: es un error transitorio mas.
+    async fn run<T, F, Fut>(&self, breaker: &CircuitBreaker, op: F) -> Result<T, Failure>
+    where
+        F: Fn(MultiplexedConnection) -> Fut,
+        Fut: Future<Output = Result<T, Failure>>,
+    {
+        with_retry_cb(breaker, || async {
+            match op(self.get()).await {
+                Err(e) if needs_reconnect(&e) => {
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "conexion con el master inservible; re-resolviendo",
+                        error = %e
+                    );
+                    self.recover().await?;
+                    op(self.get()).await
+                }
+                other => other,
+            }
+        })
+        .await
+    }
+}
+
 /// Contexto clonable que lleva cada tarea de procesamiento. La conexion se
-/// pasa por parametro: se establece una vez en `run()`. `Clone` es manual:
-/// los adaptadores `S`/`K` no son clonables, pero viajan en `Arc`.
+/// pasa por parametro (`Arc<MasterConn>`, re-resoluble): se establece una
+/// vez en `run()`. `Clone` es manual: los adaptadores `S`/`K` no son
+/// clonables, pero viajan en `Arc`.
 pub struct JobContext<S: ObjectSource, K: TextSink> {
     pub cfg: ConsumerConfig,
     pub pipeline: Arc<ExtractionPipeline<S, K>>,
@@ -125,14 +237,21 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     pub async fn run(&self, token: CancellationToken) -> Result<(), RunnerError> {
         let ctx = &self.ctx;
-        let client = redis::Client::open(ctx.cfg.redis_url.as_str())
-            .map_err(|e| RunnerError::Config(e.to_string()))?;
+        // Config invalida falla aca, sin I/O y sin volcar credenciales (T-07).
+        ctx.cfg.validate().map_err(RunnerError::Config)?;
+        // T-08: UN solo cliente re-resoluble compartido por todas las
+        // conexiones; ante failover cada MasterConn llama a `reset` y
+        // reconecta contra el master vigente.
+        let client =
+            Arc::new(RedisClient::new(&ctx.cfg).map_err(|e| RunnerError::Config(e.to_string()))?);
         // Apagado responsivo: el retry de conexion puede durar hasta 30s;
         // el token lo corta sin esperar al presupuesto de apagado.
-        let mut conn = tokio::select! {
+        let shared = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            r = Self::connect(ctx, &client) => r?,
+            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, false) => r?,
         };
+        let shared = Arc::new(shared);
+        let mut conn = shared.get();
         match tokio::select! {
             _ = token.cancelled() => return Ok(()),
             r = timeout(REDIS_OP_TIMEOUT, group::ensure_group(&mut conn, &ctx.cfg)) => r,
@@ -141,6 +260,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             Ok(Err(e)) => return Err(RunnerError::from(e)),
             Err(_) => return Err(RunnerError::Config("ensure_group timeout".to_string())),
         }
+        drop(conn);
 
         // El read bloqueante (XREADGROUP BLOCK) va por una conexion PROPIA.
         // Sobre una conexion multiplexada compartida, mientras el BLOCK espera,
@@ -149,9 +269,9 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // que REDIS_OP_TIMEOUT expira, se reintenta, agota el umbral del
         // breaker y el consumidor deja de leer. Medido: con BLOCK=5000 el
         // breaker abria a los ~15s y el worker moria.
-        let read_conn = tokio::select! {
+        let reader_conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            r = Self::connect_read(ctx, &client) => r?,
+            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, true) => r?,
         };
 
         // JoinSet de extracciones en vuelo; el apagado los drena con un
@@ -162,7 +282,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // bucle de lectura ni consumen el bulkhead de extracciones.
         let metrics = tokio::spawn(Self::metrics_loop(
             ctx.clone(),
-            conn.clone(),
+            shared.clone(),
             self.sem.clone(),
             token.clone(),
         ));
@@ -176,7 +296,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let (tx, mut rx) = mpsc::channel::<Vec<(String, HashMap<String, String>)>>(READ_QUEUE);
         let reader = tokio::spawn(Self::reader_loop(
             ctx.clone(),
-            read_conn,
+            Arc::new(reader_conn),
             tx.clone(),
             token.clone(),
         ));
@@ -185,11 +305,11 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // propio tick: era justamente el otro branch que cancelaba el read.
         let autoclaim_conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            r = Self::connect(ctx, &client) => r?,
+            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, false) => r?,
         };
         let autoclaim = tokio::spawn(Self::autoclaim_loop(
             ctx.clone(),
-            autoclaim_conn,
+            Arc::new(autoclaim_conn),
             self.sem.clone(),
             token.clone(),
         ));
@@ -201,7 +321,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     match maybe {
                         Some(batch) => {
                             for (id, fields) in batch {
-                                Self::spawn_job(ctx, &self.sem, &conn, &mut jobs, id, fields);
+                                Self::spawn_job(ctx, &self.sem, &shared, &mut jobs, id, fields);
                             }
                         }
                         // El reader termino: no va a llegar mas trabajo.
@@ -240,14 +360,16 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     /// Es la pieza que evita la perdida: al no estar dentro de un `select!`,
     /// ningun otro branch puede cancelar un `XREADGROUP` en vuelo. Si la
     /// lectura falla, se registra y se reintenta con una pausa corta.
+    /// Un failover re-resuelve el master dentro de `read_batch` (T-08); el
+    /// token corta la pausa entre reintentos pero nunca un read en vuelo.
     async fn reader_loop(
         ctx: JobContext<S, K>,
-        read_conn: MultiplexedConnection,
+        rc: Arc<MasterConn>,
         tx: mpsc::Sender<Vec<(String, HashMap<String, String>)>>,
         token: CancellationToken,
     ) {
         while !token.is_cancelled() {
-            match Self::read_batch(&ctx, &read_conn).await {
+            match Self::read_batch(&ctx, &rc).await {
                 Ok(batch) => {
                     if batch.is_empty() {
                         continue;
@@ -263,7 +385,14 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         msg = "lectura del stream fallo; reintentando",
                         error = %e
                     );
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // El read en vuelo NUNCA se cancela con el token
+                    // (cancelarlo ahi entrega mensajes sin procesar: defecto
+                    // medido en T-04); el token corta la pausa entre
+                    // reintentos.
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
                 }
             }
         }
@@ -271,10 +400,12 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     /// Recupera mensajes huerfanos con `XAUTOCLAIM`, en su propia tarea: su
     /// tick ya no compite con el read, asi que no lo cancela. Mantiene su
-    /// propio `JoinSet` para poder drenarlo en el apagado.
+    /// propio `JoinSet` para poder drenarlo en el apagado. Ante un failover
+    /// la conexion se re-resuelve dentro de `do_autoclaim` (T-08); el
+    /// token sigue cortando la rama en vuelo via el `select!`.
     async fn autoclaim_loop(
         ctx: JobContext<S, K>,
-        conn: MultiplexedConnection,
+        rc: Arc<MasterConn>,
         sem: Arc<Semaphore>,
         token: CancellationToken,
     ) {
@@ -286,7 +417,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = ticker.tick() => {
-                    if let Err(e) = Self::do_autoclaim(&ctx, &conn, &mut cursor, &sem, &mut jobs).await {
+                    if let Err(e) = Self::do_autoclaim(&ctx, &rc, &mut cursor, &sem, &mut jobs).await {
                         warn!(
                             service = crate::telemetry::SERVICE,
                             msg = "xautoclaim fallo",
@@ -302,7 +433,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     async fn metrics_loop(
         ctx: JobContext<S, K>,
-        conn: MultiplexedConnection,
+        rc: Arc<MasterConn>,
         sem: Arc<Semaphore>,
         token: CancellationToken,
     ) {
@@ -311,16 +442,12 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = ticker.tick() => Self::update_gauges(&ctx, &conn, &sem).await,
+                _ = ticker.tick() => Self::update_gauges(&ctx, &rc, &sem).await,
             }
         }
     }
 
-    async fn update_gauges(
-        ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
-        sem: &Arc<Semaphore>,
-    ) {
+    async fn update_gauges(ctx: &JobContext<S, K>, rc: &MasterConn, sem: &Arc<Semaphore>) {
         let in_flight = ctx
             .cfg
             .max_concurrency
@@ -337,15 +464,15 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 0.0
             });
         }
-        if let Some(depth) = Self::stream_depth(ctx, conn).await {
+        if let Some(depth) = Self::stream_depth(ctx, rc).await {
             metrics::gauge!("worker_stream_depth", "stream" => ctx.cfg.stream.clone())
                 .set(depth as f64);
         }
-        if let Some(pending) = Self::pel_pending(ctx, conn).await {
+        if let Some(pending) = Self::pel_pending(ctx, rc).await {
             metrics::gauge!("worker_pel_pending", "group" => ctx.cfg.group.clone())
                 .set(pending as f64);
         }
-        if let Some(stats) = Self::dlq_stats(ctx, conn).await {
+        if let Some(stats) = Self::dlq_stats(ctx, rc).await {
             metrics::gauge!("worker_dlq_depth", "stream" => ctx.cfg.dlq_stream.clone())
                 .set(stats.depth as f64);
             metrics::gauge!(
@@ -354,7 +481,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             )
             .set(stats.oldest_age_secs.unwrap_or(0) as f64);
         }
-        if let Some(dead) = Self::dead_consumers(ctx, conn).await {
+        if let Some(dead) = Self::dead_consumers(ctx, rc).await {
             metrics::gauge!("worker_dead_consumers", "group" => ctx.cfg.group.clone())
                 .set(dead.len() as f64);
             for consumer in dead {
@@ -370,137 +497,111 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         }
     }
 
-    async fn dlq_stats(
-        ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
-    ) -> Option<dlq::DlqStats> {
-        let mut c = conn.clone();
+    /// Best-effort para los gauges: si el fallo fue un failover, re-resuelve
+    /// el master para que la proxima vuelta use la conexion nueva. Los
+    /// gauges siguen sin contar para el breaker ni reintentar (igual que
+    /// antes): el tick siguiente es su backoff natural.
+    async fn recover_on_failover(rc: &MasterConn, failover: bool) {
+        if !failover {
+            return;
+        }
+        warn!(
+            service = crate::telemetry::SERVICE,
+            msg = "failover de Redis en metricas; re-resolviendo el master"
+        );
+        if let Err(e) = rc.recover().await {
+            warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "la recuperacion del master fallo; se reintenta en el proximo tick",
+                error = %e
+            );
+        }
+    }
+
+    async fn dlq_stats(ctx: &JobContext<S, K>, rc: &MasterConn) -> Option<dlq::DlqStats> {
+        let mut c = rc.get();
         let cfg = ctx.cfg.clone();
         match timeout(REDIS_OP_TIMEOUT, dlq::stats(&mut c, &cfg)).await {
             Ok(Ok(v)) => Some(v),
-            _ => None,
+            Ok(Err(e)) => {
+                let failover = matches!(&e, dlq::DlqError::Redis(r) if redis_conn::is_failover(r));
+                Self::recover_on_failover(rc, failover).await;
+                None
+            }
+            Err(_) => None,
         }
     }
 
     async fn dead_consumers(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &MasterConn,
     ) -> Option<Vec<redis::streams::StreamInfoConsumer>> {
-        let mut c = conn.clone();
+        let mut c = rc.get();
         let cfg = ctx.cfg.clone();
         match timeout(REDIS_OP_TIMEOUT, group::dead_consumers(&mut c, &cfg)).await {
             Ok(Ok(v)) => Some(v),
-            _ => None,
+            Ok(Err(e)) => {
+                let failover =
+                    matches!(&e, group::GroupError::Redis(r) if redis_conn::is_failover(r));
+                Self::recover_on_failover(rc, failover).await;
+                None
+            }
+            Err(_) => None,
         }
     }
 
-    async fn stream_depth(ctx: &JobContext<S, K>, conn: &MultiplexedConnection) -> Option<u64> {
-        let mut c = conn.clone();
+    async fn stream_depth(ctx: &JobContext<S, K>, rc: &MasterConn) -> Option<u64> {
+        let mut c = rc.get();
         let stream = ctx.cfg.stream.clone();
         match timeout(REDIS_OP_TIMEOUT, c.xlen::<_, u64>(&stream)).await {
             Ok(Ok(n)) => Some(n),
-            _ => None,
+            Ok(Err(e)) => {
+                Self::recover_on_failover(rc, redis_conn::is_failover(&e)).await;
+                None
+            }
+            Err(_) => None,
         }
     }
 
-    async fn pel_pending(ctx: &JobContext<S, K>, conn: &MultiplexedConnection) -> Option<u64> {
-        let mut c = conn.clone();
+    async fn pel_pending(ctx: &JobContext<S, K>, rc: &MasterConn) -> Option<u64> {
+        let mut c = rc.get();
         let cfg = ctx.cfg.clone();
         match timeout(REDIS_OP_TIMEOUT, group::pending_summary(&mut c, &cfg)).await {
             Ok(Ok(v)) => v.get("pending_count").and_then(serde_json::Value::as_u64),
-            _ => None,
+            Ok(Err(e)) => {
+                let failover =
+                    matches!(&e, group::GroupError::Redis(r) if redis_conn::is_failover(r));
+                Self::recover_on_failover(rc, failover).await;
+                None
+            }
+            Err(_) => None,
         }
-    }
-
-    /// Conexion inicial con Retry+CB de Redis: corta cuando el breaker lo
-    /// decide o se agota el tiempo maximo de reintento.
-    async fn connect(
-        ctx: &JobContext<S, K>,
-        client: &redis::Client,
-    ) -> Result<MultiplexedConnection, RunnerError> {
-        with_retry_cb(&ctx.redis_breaker, || async {
-            match timeout(REDIS_OP_TIMEOUT, client.get_multiplexed_async_connection()).await {
-                Ok(Ok(c)) => Ok(c),
-                Ok(Err(e)) => Err(classify_redis_error(&e)),
-                Err(_) => Err(Failure::transient(
-                    REDIS_TIMEOUT_CODE,
-                    "redis connect timeout",
-                )),
-            }
-        })
-        .await
-        .map_err(RunnerError::from)
-    }
-
-    /// Conexion EXCLUSIVA para el read bloqueante.
-    ///
-    /// Ademas de estar separada de la compartida, tiene que desactivar el
-    /// `response_timeout`: el default de redis-rs es 500 ms
-    /// (`DEFAULT_RESPONSE_TIMEOUT`), y un `XREADGROUP ... BLOCK 5000` lo supera
-    /// siempre, devolviendo `REDIS_IO: timed out`. Ese timeout, reintentado,
-    /// es lo que abria el breaker a los ~15 s. La duracion del read ya esta
-    /// acotada por `timeout(block_ms + 2000)` en `read_batch`.
-    async fn connect_read(
-        ctx: &JobContext<S, K>,
-        client: &redis::Client,
-    ) -> Result<MultiplexedConnection, RunnerError> {
-        let cfg = AsyncConnectionConfig::new().set_response_timeout(None);
-        with_retry_cb(&ctx.redis_breaker, || async {
-            match timeout(
-                REDIS_OP_TIMEOUT,
-                client.get_multiplexed_async_connection_with_config(&cfg),
-            )
-            .await
-            {
-                Ok(Ok(c)) => Ok(c),
-                Ok(Err(e)) => Err(classify_redis_error(&e)),
-                Err(_) => Err(Failure::transient(
-                    REDIS_TIMEOUT_CODE,
-                    "redis connect timeout",
-                )),
-            }
-        })
-        .await
-        .map_err(RunnerError::from)
-    }
-
-    /// Corre `op` con Retry+CB de Redis sobre un clon del pool de conexion
-    /// (`MultiplexedConnection: Clone`; los clones comparten el mismo socket).
-    async fn retry_redis<T, F, Fut>(
-        ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
-        op: F,
-    ) -> Result<T, Failure>
-    where
-        F: Fn(MultiplexedConnection) -> Fut,
-        Fut: Future<Output = Result<T, Failure>>,
-    {
-        with_retry_cb(&ctx.redis_breaker, || op(conn.clone())).await
     }
 
     async fn read_batch(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &MasterConn,
     ) -> Result<Vec<(String, HashMap<String, String>)>, RunnerError> {
         let cfg = &ctx.cfg;
-        let streams: StreamReadReply = Self::retry_redis(ctx, conn, |mut c| async move {
-            let opts = StreamReadOptions::default()
-                .group(&cfg.group, &cfg.consumer_name)
-                .count(cfg.count)
-                .block(cfg.block_ms as usize);
-            let keys = vec![cfg.stream.clone()];
-            match timeout(
-                Duration::from_millis(cfg.block_ms + 2000),
-                c.xread_options(&keys, &[">".to_string()], &opts),
-            )
-            .await
-            {
-                Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Err(classify_redis_error(&e)),
-                Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xreadgroup timeout")),
-            }
-        })
-        .await?;
+        let streams: StreamReadReply = rc
+            .run(&ctx.redis_breaker, |mut c| async move {
+                let opts = StreamReadOptions::default()
+                    .group(&cfg.group, &cfg.consumer_name)
+                    .count(cfg.count)
+                    .block(cfg.block_ms as usize);
+                let keys = vec![cfg.stream.clone()];
+                match timeout(
+                    Duration::from_millis(cfg.block_ms + 2000),
+                    c.xread_options(&keys, &[">".to_string()], &opts),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => Ok(s),
+                    Ok(Err(e)) => Err(classify_redis_error(&e)),
+                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xreadgroup timeout")),
+                }
+            })
+            .await?;
 
         Ok(streams
             .keys
@@ -524,30 +625,33 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     /// Despacha una tarea de procesamiento. El permiso del bulkhead se toma
     /// dentro de la tarea: mientras espera, solo retiene el payload chico.
+    /// La conexion viaja como `Arc<MasterConn>`: cada escritura del job
+    /// (delivery count, DLQ, ACK) pasa por `run`, que re-resuelve el
+    /// master ante un failover (T-08).
     fn spawn_job(
         ctx: &JobContext<S, K>,
         sem: &Arc<Semaphore>,
-        conn: &MultiplexedConnection,
+        rc: &Arc<MasterConn>,
         jobs: &mut JoinSet<()>,
         msg_id: String,
         fields: HashMap<String, String>,
     ) {
         let ctx = ctx.clone();
-        let conn = conn.clone();
+        let rc = Arc::clone(rc);
         let sem = sem.clone();
         jobs.spawn(async move {
             let _permit: OwnedSemaphorePermit = match sem.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return, // sem cerrado: apagado en curso
             };
-            Self::run_job(ctx, conn, msg_id, fields).await;
+            Self::run_job(ctx, rc, msg_id, fields).await;
         });
     }
 
     /// Politica F3 compartida por `XREADGROUP` y `XAUTOCLAIM`.
     async fn run_job(
         ctx: JobContext<S, K>,
-        conn: MultiplexedConnection,
+        rc: Arc<MasterConn>,
         msg_id: String,
         fields: HashMap<String, String>,
     ) {
@@ -565,8 +669,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 );
                 metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
                 let (code, kind) = contract_cause(&issue);
-                Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind)
-                    .await;
+                Self::dlq_and_log(&ctx, &rc, &msg_id, &item, code, &issue.to_string(), kind).await;
                 return;
             }
         };
@@ -580,12 +683,12 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             );
             metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
             let (code, kind) = contract_cause(&issue);
-            Self::dlq_and_log(&ctx, &conn, &msg_id, &item, code, &issue.to_string(), kind).await;
+            Self::dlq_and_log(&ctx, &rc, &msg_id, &item, code, &issue.to_string(), kind).await;
             return;
         }
 
         // S2-P3-07: sin reintentar el trabajo si ya agoto sus intentos.
-        let attempts = match Self::delivery_count(&ctx, &conn, &msg_id).await {
+        let attempts = match Self::delivery_count(&ctx, &rc, &msg_id).await {
             Ok(a) => a,
             Err(e) => {
                 warn!(
@@ -617,7 +720,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             metrics::counter!("worker_documents_total", "outcome" => "failed").increment(1);
             Self::dlq_and_log(
                 &ctx,
-                &conn,
+                &rc,
                 &msg_id,
                 &item,
                 MAX_ATTEMPTS_EXCEEDED,
@@ -657,7 +760,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     consumer = %cfg.consumer_name,
                     attempts
                 );
-                Self::ack_and_log(&ctx, &conn, &msg_id, &item).await;
+                Self::ack_and_log(&ctx, &rc, &msg_id, &item).await;
                 return;
             }
             Err(e) => {
@@ -683,7 +786,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                         .increment(1);
                     Self::dlq_and_log(
                         &ctx,
-                        &conn,
+                        &rc,
                         &msg_id,
                         &item,
                         &code,
@@ -727,7 +830,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 // subido es identico (put idempotente) y el estado ajeno no
                 // se pisa. En ambos casos la entrega se confirma.
                 metrics::counter!("worker_documents_total", "outcome" => "completed").increment(1);
-                Self::ack_and_log(&ctx, &conn, &msg_id, &item).await;
+                Self::ack_and_log(&ctx, &rc, &msg_id, &item).await;
             }
             Err(e) => {
                 // Compensacion (S2-P3-09): borrar el .txt y dejar el documento
@@ -824,13 +927,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         .await
     }
 
-    async fn ack_and_log(
-        ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
-        msg_id: &str,
-        item: &WorkItem,
-    ) {
-        match Self::ack(ctx, conn, msg_id).await {
+    async fn ack_and_log(ctx: &JobContext<S, K>, rc: &MasterConn, msg_id: &str, item: &WorkItem) {
+        match Self::ack(ctx, rc, msg_id).await {
             Ok(()) => info!(
                 service = crate::telemetry::SERVICE,
                 msg = "documento completado y ACK-eado",
@@ -887,13 +985,9 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         }
     }
 
-    async fn ack(
-        ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
-        msg_id: &str,
-    ) -> Result<(), Failure> {
+    async fn ack(ctx: &JobContext<S, K>, rc: &MasterConn, msg_id: &str) -> Result<(), Failure> {
         let cfg = &ctx.cfg;
-        Self::retry_redis(ctx, conn, |mut c| {
+        rc.run(&ctx.redis_breaker, |mut c| {
             let id = msg_id.to_string();
             async move {
                 let acked: i64 = match timeout(
@@ -919,36 +1013,37 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     /// `min_idle_ms > 2x job_timeout` y los procesa igual que los nuevos.
     async fn do_autoclaim(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &Arc<MasterConn>,
         cursor: &mut String,
         sem: &Arc<Semaphore>,
         jobs: &mut JoinSet<()>,
     ) -> Result<(), RunnerError> {
         let cfg = &ctx.cfg;
-        let reply: StreamAutoClaimReply = Self::retry_redis(ctx, conn, |mut c| {
-            let start = cursor.clone();
-            async move {
-                let opts = StreamAutoClaimOptions::default().count(cfg.count);
-                match timeout(
-                    REDIS_OP_TIMEOUT,
-                    c.xautoclaim_options(
-                        &cfg.stream,
-                        &cfg.group,
-                        &cfg.consumer_name,
-                        cfg.min_idle_ms,
-                        start.as_str(),
-                        opts,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => Ok(r),
-                    Ok(Err(e)) => Err(classify_redis_error(&e)),
-                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xautoclaim timeout")),
+        let reply: StreamAutoClaimReply = rc
+            .run(&ctx.redis_breaker, |mut c| {
+                let start = cursor.clone();
+                async move {
+                    let opts = StreamAutoClaimOptions::default().count(cfg.count);
+                    match timeout(
+                        REDIS_OP_TIMEOUT,
+                        c.xautoclaim_options(
+                            &cfg.stream,
+                            &cfg.group,
+                            &cfg.consumer_name,
+                            cfg.min_idle_ms,
+                            start.as_str(),
+                            opts,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => Err(classify_redis_error(&e)),
+                        Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xautoclaim timeout")),
+                    }
                 }
-            }
-        })
-        .await?;
+            })
+            .await?;
         *cursor = reply.next_stream_id;
 
         for entry in reply.claimed {
@@ -962,7 +1057,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     _ => None,
                 })
                 .collect();
-            Self::spawn_job(ctx, sem, conn, jobs, entry.id, fields);
+            Self::spawn_job(ctx, sem, rc, jobs, entry.id, fields);
         }
         if !reply.deleted_ids.is_empty() {
             info!(
@@ -978,11 +1073,11 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     /// dejar el mensaje pendiente (nunca se DLQ-ea a ciegas).
     async fn delivery_count(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &MasterConn,
         msg_id: &str,
     ) -> Result<u64, Failure> {
         let cfg = &ctx.cfg;
-        Self::retry_redis(ctx, conn, |mut c| {
+        rc.run(&ctx.redis_breaker, |mut c| {
             let id = msg_id.to_string();
             async move {
                 match timeout(
@@ -1005,7 +1100,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     #[allow(clippy::too_many_arguments)]
     async fn dlq_move(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &MasterConn,
         msg_id: &str,
         item: &WorkItem,
         error_code: &str,
@@ -1013,49 +1108,40 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         error_kind: ErrorKind,
     ) -> Result<bool, RunnerError> {
         let cfg = &ctx.cfg;
-        let moved = Self::retry_redis(ctx, conn, |mut c| {
-            let id = msg_id.to_string();
-            let item = item.clone();
-            let message = error_message.to_string();
-            async move {
-                match timeout(
-                    REDIS_OP_TIMEOUT,
-                    dlq::move_to_dlq_with_cause(
-                        &mut c, cfg, &id, &item, error_code, &message, error_kind,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(moved)) => Ok(moved),
-                    Ok(Err(e)) => Err(Failure::from(e)),
-                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "dlq eval timeout")),
+        let moved = rc
+            .run(&ctx.redis_breaker, |mut c| {
+                let id = msg_id.to_string();
+                let item = item.clone();
+                let message = error_message.to_string();
+                async move {
+                    match timeout(
+                        REDIS_OP_TIMEOUT,
+                        dlq::move_to_dlq_with_cause(
+                            &mut c, cfg, &id, &item, error_code, &message, error_kind,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(moved)) => Ok(moved),
+                        Ok(Err(e)) => Err(Failure::from(e)),
+                        Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "dlq eval timeout")),
+                    }
                 }
-            }
-        })
-        .await?;
+            })
+            .await?;
         Ok(moved)
     }
 
     async fn dlq_and_log(
         ctx: &JobContext<S, K>,
-        conn: &MultiplexedConnection,
+        rc: &MasterConn,
         msg_id: &str,
         item: &WorkItem,
         error_code: &str,
         error_message: &str,
         error_kind: ErrorKind,
     ) {
-        match Self::dlq_move(
-            ctx,
-            conn,
-            msg_id,
-            item,
-            error_code,
-            error_message,
-            error_kind,
-        )
-        .await
-        {
+        match Self::dlq_move(ctx, rc, msg_id, item, error_code, error_message, error_kind).await {
             Ok(true) => {
                 metrics::counter!("worker_dlq_total", "cause" => error_code.to_string())
                     .increment(1);
@@ -1218,5 +1304,171 @@ mod tests {
         let aborted = drain_jobs(&mut jobs, Duration::from_secs(1)).await;
         assert_eq!(aborted, 0);
         assert!(jobs.is_empty());
+    }
+
+    // --- T-08: re-resolucion del master ante failover ---
+
+    /// Servidor RESP stub: cuenta aceptaciones y responde `+OK` de mas,
+    /// suficiente para que `connect` (setup CLIENT SETINFO) complete.
+    fn spawn_ok_server() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("bind server: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let _ = stream.write_all(
+                                    b"+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    fn direct_cfg(url: &str) -> ConsumerConfig {
+        let _guard = crate::consumer::config::test_env::lock();
+        std::env::remove_var("REDIS_SENTINEL_ADDRS");
+        std::env::remove_var("REDIS_MASTER_NAME");
+        std::env::set_var("REDIS_URL", url);
+        ConsumerConfig::from_env()
+    }
+
+    fn readonly_failure() -> Failure {
+        classify_redis_error(&redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly),
+            "READONLY You can't write against a read only replica.",
+        )))
+    }
+
+    #[tokio::test]
+    async fn master_conn_reconecta_tras_fallo_de_failover() {
+        let (addr, accepts) = spawn_ok_server();
+        let cfg = direct_cfg(&format!("redis://{addr}/"));
+        let client = std::sync::Arc::new(
+            redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
+        );
+        let breaker = CircuitBreaker::default();
+        let rc = MasterConn::establish(client, &breaker, false)
+            .await
+            .unwrap_or_else(|e| panic!("establish: {e}"));
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "la conexion inicial abre un socket"
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = {
+            let calls = std::sync::Arc::clone(&calls);
+            rc.run(&breaker, |_conn| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        // Primer intento: el master viejo responde READONLY.
+                        Err(readonly_failure())
+                    } else {
+                        Ok(7u8)
+                    }
+                }
+            })
+            .await
+        };
+        assert_eq!(result.ok(), Some(7), "tras re-resolver debe triunfar");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "la operacion se reintenta sobre la conexion nueva"
+        );
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "el failover debe haber descartado la conexion y abierto OTRA"
+        );
+    }
+
+    #[tokio::test]
+    async fn master_conn_sin_failover_no_reconecta() {
+        let (addr, accepts) = spawn_ok_server();
+        let cfg = direct_cfg(&format!("redis://{addr}/"));
+        let client = std::sync::Arc::new(
+            redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
+        );
+        let breaker = CircuitBreaker::default();
+        let rc = MasterConn::establish(client, &breaker, false)
+            .await
+            .unwrap_or_else(|e| panic!("establish: {e}"));
+        let before = accepts.load(std::sync::atomic::Ordering::SeqCst);
+
+        let result = rc
+            .run(&breaker, |_conn| async { Ok::<u8, Failure>(1) })
+            .await;
+        assert_eq!(result.ok(), Some(1));
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "un camino sin failover no debe abrir conexiones nuevas"
+        );
+    }
+
+    #[tokio::test]
+    async fn master_conn_reconecta_si_el_socket_muere() {
+        // Observado en el stack real de failover: el master viejo cierra el
+        // socket (`broken pipe`) en vez de responder READONLY. El conn
+        // multiplexado no se auto-repara: sin reconnect el worker queda
+        // trabado en el breaker para siempre.
+        let (addr, accepts) = spawn_ok_server();
+        let cfg = direct_cfg(&format!("redis://{addr}/"));
+        let client = std::sync::Arc::new(
+            redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
+        );
+        let breaker = CircuitBreaker::default();
+        let rc = MasterConn::establish(client, &breaker, false)
+            .await
+            .unwrap_or_else(|e| panic!("establish: {e}"));
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = {
+            let calls = std::sync::Arc::clone(&calls);
+            rc.run(&breaker, |_conn| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(classify_redis_error(&redis::RedisError::from((
+                            redis::ErrorKind::Io,
+                            "broken pipe",
+                        ))))
+                    } else {
+                        Ok(9u8)
+                    }
+                }
+            })
+            .await
+        };
+        assert_eq!(result.ok(), Some(9), "tras reconectar debe triunfar");
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "un socket muerto debe reemplazarse con una conexion nueva"
+        );
     }
 }
