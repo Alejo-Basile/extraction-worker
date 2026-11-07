@@ -41,6 +41,19 @@ read_file_secret() {
 read_file_secret S3_ACCESS_KEY_FILE
 read_file_secret S3_SECRET_KEY_FILE
 
+# Sentinel es opt-in. No mostrar direcciones ni valores de configuración en logs.
+if [ -n "${REDIS_SENTINEL_ADDRS:-}" ] && [ -z "${REDIS_MASTER_NAME:-}" ]; then
+    echo "entrypoint: REDIS_MASTER_NAME es obligatorio con REDIS_SENTINEL_ADDRS" >&2
+    exit 1
+fi
+if [ -z "${REDIS_SENTINEL_ADDRS:-}" ] && [ -n "${REDIS_MASTER_NAME:-}" ]; then
+    echo "entrypoint: REDIS_SENTINEL_ADDRS es obligatorio con REDIS_MASTER_NAME" >&2
+    exit 1
+fi
+if [ -z "${REDIS_SENTINEL_ADDRS:-}" ]; then
+    unset REDIS_SENTINEL_ADDRS REDIS_MASTER_NAME REDIS_SENTINEL_PASSWORD
+fi
+
 # Percent-encoding de todos los bytes (RFC 3986 2.1). Es legal en el userinfo
 # de una URI y evita depender de que la password sea alfanumerica: los secretos
 # del stack llevan caracteres especiales y el driver de Mongo rechaza la URI
@@ -53,9 +66,9 @@ urlencode() {
     done
 }
 
-# El worker lee una URL completa, no una password suelta: se arma aca para no
-# escribir el secreto en el compose. `$(cat ...)` recorta el newline final del
-# archivo, que no forma parte del secreto.
+# El worker conserva REDIS_URL como fallback directo y extrae de ella la
+# autenticacion de Sentinel. Se arma aca para no escribir el secreto en Compose.
+# `$(cat ...)` recorta el newline final del archivo, que no forma parte del secreto.
 if [ -z "${REDIS_URL:-}" ] && [ -n "${REDIS_PASSWORD_FILE:-}" ]; then
     redis_password=$(urlencode "$(cat "${REDIS_PASSWORD_FILE}")")
     export REDIS_URL="redis://:${redis_password}@${REDIS_HOST:-redis-streams}:${REDIS_PORT:-6379}/${REDIS_DB:-0}"

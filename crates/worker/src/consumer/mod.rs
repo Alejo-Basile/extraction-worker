@@ -14,6 +14,7 @@ pub mod config;
 pub mod dlq;
 pub mod group;
 pub mod pipeline;
+pub mod redis_conn;
 pub mod replay;
 pub mod resilience;
 pub mod runner;
