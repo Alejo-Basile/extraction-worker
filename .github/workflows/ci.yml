@@ -65,6 +65,83 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # --- Stack Sentinel (T-08): master + replica + 3 sentinels ----------
+      # Topologia para el IT de failover (tests/sentinel_it.rs). Sin
+      # password (credenciales dev) y con `protected-mode no`: es un stack
+      # descartable del job. Los sentinels generan su conf con `sh -c`
+      # (Sentinel exige un config file en disco) y esperan a resolver
+      # `redis-master` por DNS antes de arrancar, asi el orden de creacion
+      # de los servicios no importa. Se anuncian IPs (sin
+      # announce-hostnames): el test corre en el host y las alcanza via la
+      # red bridge de Docker en Linux.
+      redis-master:
+        image: redis:7-alpine
+        ports:
+          - 6381:6379
+        command: redis-server --port 6379 --protected-mode no
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis-replica:
+        image: redis:7-alpine
+        ports:
+          - 6382:6379
+        command: redis-server --port 6379 --protected-mode no --replicaof redis-master 6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      sentinel-1:
+        image: redis:7-alpine
+        ports:
+          - 26379:26379
+        command: >-
+          sh -c "while ! getent hosts redis-master >/dev/null 2>&1; do sleep 1; done;
+          printf '%s\n' 'port 26379' 'dir /tmp' 'protected-mode no'
+          'sentinel resolve-hostnames yes' 'sentinel monitor myprimary redis-master 6379 2'
+          'sentinel down-after-milliseconds myprimary 5000'
+          'sentinel failover-timeout myprimary 10000' 'sentinel parallel-syncs myprimary 1'
+          > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel"
+        options: >-
+          --health-cmd "redis-cli -p 26379 ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 6
+      sentinel-2:
+        image: redis:7-alpine
+        ports:
+          - 26380:26379
+        command: >-
+          sh -c "while ! getent hosts redis-master >/dev/null 2>&1; do sleep 1; done;
+          printf '%s\n' 'port 26379' 'dir /tmp' 'protected-mode no'
+          'sentinel resolve-hostnames yes' 'sentinel monitor myprimary redis-master 6379 2'
+          'sentinel down-after-milliseconds myprimary 5000'
+          'sentinel failover-timeout myprimary 10000' 'sentinel parallel-syncs myprimary 1'
+          > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel"
+        options: >-
+          --health-cmd "redis-cli -p 26379 ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 6
+      sentinel-3:
+        image: redis:7-alpine
+        ports:
+          - 26381:26379
+        command: >-
+          sh -c "while ! getent hosts redis-master >/dev/null 2>&1; do sleep 1; done;
+          printf '%s\n' 'port 26379' 'dir /tmp' 'protected-mode no'
+          'sentinel resolve-hostnames yes' 'sentinel monitor myprimary redis-master 6379 2'
+          'sentinel down-after-milliseconds myprimary 5000'
+          'sentinel failover-timeout myprimary 10000' 'sentinel parallel-syncs myprimary 1'
+          > /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel"
+        options: >-
+          --health-cmd "redis-cli -p 26379 ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 6
       minio:
         # MinIO retiro sus imagenes oficiales upstream; bitnamilegacy es la
         # ultima via publica (misma eleccion que labs/docker-compose.yml).
@@ -120,6 +197,10 @@ jobs:
       - name: cargo test ignored
         env:
           REDIS_TEST_URL: redis://127.0.0.1:6379/
+          # Stack Sentinel del job (T-08): el IT de failover resuelve el
+          # master via estos sentinels y provoca SENTINEL FAILOVER.
+          REDIS_SENTINEL_ADDRS: 127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+          REDIS_MASTER_NAME: myprimary
           S3_ENDPOINT: http://127.0.0.1:9000
           S3_ACCESS_KEY: worker-dev
           S3_SECRET_KEY: worker-dev-secret

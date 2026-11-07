@@ -12,7 +12,10 @@ use actix_web::{
 };
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusHandle;
+use tracing::warn;
 
+use crate::consumer::config::ConsumerConfig;
+use crate::consumer::redis_conn;
 use crate::document_store::DocumentStore;
 use crate::objects::ObjectStoreSource;
 
@@ -21,34 +24,88 @@ pub async fn healthz() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
 }
 
+/// Fuente de Redis para [`Readiness`].
+///
+/// - `&ConsumerConfig`: camino principal (T-08) — Sentinel-aware via
+///   `redis_conn::build_client`; PING + `ROLE`, y el master se re-resuelve
+///   ante un PING fallido o un nodo que ya no es master.
+/// - `&str`: compatibilidad historica del constructor — URL explicita en
+///   modo directo sobre esa URL (ignora las claves sentinel del entorno,
+///   que es lo que los call sites con `&str` esperan).
+pub trait ReadinessRedis {
+    fn readiness_client(&self) -> Result<Arc<redis_conn::RedisClient>, String>;
+
+    /// `true` si este camino debe confirmar con `ROLE` que la instancia
+    /// vigente es el master (T-08). Por defecto solo PING (compatibilidad).
+    fn readiness_checks_master(&self) -> bool {
+        false
+    }
+}
+
+fn client_from_cfg(cfg: &ConsumerConfig) -> Result<Arc<redis_conn::RedisClient>, String> {
+    Ok(Arc::new(
+        redis_conn::RedisClient::new(cfg).map_err(|e| format!("redis: {e}"))?,
+    ))
+}
+
+impl ReadinessRedis for &ConsumerConfig {
+    fn readiness_client(&self) -> Result<Arc<redis_conn::RedisClient>, String> {
+        client_from_cfg(self)
+    }
+
+    fn readiness_checks_master(&self) -> bool {
+        true
+    }
+}
+
+impl ReadinessRedis for &str {
+    fn readiness_client(&self) -> Result<Arc<redis_conn::RedisClient>, String> {
+        let mut cfg = ConsumerConfig::from_env();
+        cfg.redis_url = (*self).to_string();
+        cfg.redis_sentinel_addrs.clear();
+        cfg.redis_master_name = None;
+        // T-10: modo directo ignora Sentinel por completo, auth incluida.
+        cfg.redis_sentinel_password = None;
+        client_from_cfg(&cfg)
+    }
+}
+
 /// Verificacion real de dependencias para `/readyz` (DoD global punto 5,
-/// F3b): Redis (PING), MinIO (head de una clave sonda) y Mongo (PING).
+/// F3b): Redis (PING al master ACTUAL, Sentinel-aware en T-08), MinIO
+/// (head de una clave sonda) y Mongo (PING).
 pub struct Readiness {
-    redis: redis::Client,
+    redis: Arc<redis_conn::RedisClient>,
     minio: ObjectStoreSource,
     mongo: Arc<DocumentStore>,
     redis_timeout: Duration,
+    redis_checks_master: bool,
 }
 
 impl Readiness {
     pub fn new(
-        redis_url: &str,
+        redis: impl ReadinessRedis,
         minio: ObjectStoreSource,
         mongo: Arc<DocumentStore>,
     ) -> Result<Self, String> {
-        let redis =
-            redis::Client::open(redis_url).map_err(|e| format!("REDIS_URL invalida: {e}"))?;
+        let redis_checks_master = redis.readiness_checks_master();
         Ok(Self {
-            redis,
+            redis: redis.readiness_client()?,
             minio,
             mongo,
             redis_timeout: Duration::from_secs(2),
+            redis_checks_master,
         })
     }
 
     /// Chequeos en paralelo; cada uno con su propio timeout acotado.
     pub async fn check_all(&self) -> Vec<(&'static str, Result<(), String>)> {
-        let redis_check = Self::redis_ping(&self.redis, self.redis_timeout);
+        let redis_check = async {
+            if self.redis_checks_master {
+                Self::redis_ping(&self.redis, self.redis_timeout).await
+            } else {
+                Self::redis_ping_only(&self.redis, self.redis_timeout).await
+            }
+        };
         let minio_check = self.minio.check();
         let mongo_check = self.mongo.ping();
         let (r, m, g) = tokio::join!(redis_check, minio_check, mongo_check,);
@@ -59,8 +116,59 @@ impl Readiness {
         ]
     }
 
-    async fn redis_ping(client: &redis::Client, timeout: Duration) -> Result<(), String> {
-        let mut conn = tokio::time::timeout(timeout, client.get_multiplexed_async_connection())
+    /// PING y `ROLE` al master vigente (T-08). Si el nodo no es master
+    /// (p.ej. quedo como replica tras un failover) o el PING falla, se
+    /// re-resuelve via la fabrica (`RedisClient::reset`) y se reintenta UNA
+    /// vez: `/readyz` siempre comprueba el master actual, no la IP cacheada
+    /// al arrancar.
+    async fn redis_ping(
+        redis: &Arc<redis_conn::RedisClient>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        Self::ping_with_reset(redis, timeout, true).await
+    }
+
+    /// Camino historico (`&str`): solo PING, sin comprobacion de `ROLE`.
+    /// Conserva el reintento tras fallo de transporte para no cambiar el
+    /// comportamiento que esperan los call sites existentes.
+    async fn redis_ping_only(
+        redis: &Arc<redis_conn::RedisClient>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        Self::ping_with_reset(redis, timeout, false).await
+    }
+
+    async fn ping_with_reset(
+        redis: &Arc<redis_conn::RedisClient>,
+        timeout: Duration,
+        verify_master: bool,
+    ) -> Result<(), String> {
+        match Self::ping_once(redis, timeout, verify_master).await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "readyz: el master no respondio o no es master; re-resolviendo",
+                    error = %first
+                );
+                if let Err(e) = redis.reset_async().await {
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "readyz: la re-resolucion del master fallo",
+                        error = %e
+                    );
+                }
+                Self::ping_once(redis, timeout, verify_master).await
+            }
+        }
+    }
+
+    async fn ping_once(
+        redis: &Arc<redis_conn::RedisClient>,
+        timeout: Duration,
+        verify_master: bool,
+    ) -> Result<(), String> {
+        let mut conn = tokio::time::timeout(timeout, redis.connect())
             .await
             .map_err(|_| "redis: timeout conectando".to_string())?
             .map_err(|e| format!("redis: {e}"))?;
@@ -68,11 +176,42 @@ impl Readiness {
             .await
             .map_err(|_| "redis: timeout en PING".to_string())?
             .map_err(|e| format!("redis: {e}"))?;
-        if pong == "PONG" {
+        if pong != "PONG" {
+            return Err(format!("redis: respuesta inesperada {pong:?}"));
+        }
+        if !verify_master {
+            return Ok(());
+        }
+        let role = Self::role_of(&mut conn, timeout).await?;
+        if role == "master" {
             Ok(())
         } else {
-            Err(format!("redis: respuesta inesperada {pong:?}"))
+            Err(format!("redis: la instancia no es master (ROLE={role})"))
         }
+    }
+
+    /// Primer elemento de `ROLE` (`master`/`slave`/...); una respuesta
+    /// inesperada se traduce a rol vacio y, por tanto, a un chequeo fallido.
+    async fn role_of(
+        conn: &mut redis::aio::MultiplexedConnection,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let reply: redis::Value =
+            tokio::time::timeout(timeout, redis::cmd("ROLE").query_async(conn))
+                .await
+                .map_err(|_| "redis: timeout en ROLE".to_string())?
+                .map_err(|e| format!("redis: {e}"))?;
+        let role = match reply {
+            redis::Value::Array(items) => match items.into_iter().next() {
+                Some(redis::Value::BulkString(bytes)) => {
+                    String::from_utf8_lossy(&bytes).to_string()
+                }
+                Some(redis::Value::SimpleString(s)) => s,
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        Ok(role)
     }
 }
 
@@ -146,6 +285,13 @@ mod tests {
     /// tipo complejo del ServiceFactory.
     /// Readiness apuntando a puertos muertos: /readyz debe responder 503.
     async fn dead_readiness() -> Result<Readiness, String> {
+        let cfg = {
+            let _guard = crate::consumer::config::test_env::lock();
+            std::env::remove_var("REDIS_SENTINEL_ADDRS");
+            std::env::remove_var("REDIS_MASTER_NAME");
+            std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
+            crate::consumer::config::ConsumerConfig::from_env()
+        };
         let s3 = crate::objects::S3Config {
             endpoint: "http://127.0.0.1:1".to_string(),
             bucket_raw: "raw-pdfs".to_string(),
@@ -163,7 +309,7 @@ mod tests {
             })
             .await
             .map_err(|e| e.to_string())?;
-        Readiness::new("redis://127.0.0.1:1/", minio, Arc::new(mongo))
+        Readiness::new(&cfg, minio, Arc::new(mongo))
     }
 
     macro_rules! test_app {
@@ -228,5 +374,184 @@ mod tests {
             "el output debe contener la metrica HTTP: {text}"
         );
         Ok(())
+    }
+
+    // --- T-08: /readyz Sentinel-aware ---
+
+    /// Respuesta RESP de `ROLE` en una replica.
+    const ROLE_SLAVE: &[u8] = b"*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:6379\r\n$40\r\n0123456789012345678901234567890123456789\r\n:0\r\n";
+    /// Respuesta RESP de `ROLE` en el master.
+    const ROLE_MASTER: &[u8] = b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n\r\n";
+
+    /// Busca el proximo `\r\n` desde `from`.
+    fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+        buf.get(from..)?
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| from + p)
+    }
+
+    /// Extrae una orden RESP completa (`*N ...`) del buffer: devuelve el
+    /// nombre (en mayusculas) y los bytes consumidos; `None` si aun falta.
+    fn take_resp_command(buf: &[u8]) -> Option<(String, usize)> {
+        if buf.first() != Some(&b'*') {
+            return None;
+        }
+        let nl = find_crlf(buf, 1)?;
+        let argc: usize = std::str::from_utf8(&buf[1..nl]).ok()?.parse().ok()?;
+        let mut pos = nl + 2;
+        let mut command = String::new();
+        for index in 0..argc {
+            if buf.get(pos) != Some(&b'$') {
+                return None;
+            }
+            let nl = find_crlf(buf, pos + 1)?;
+            let len: usize = std::str::from_utf8(&buf[pos + 1..nl]).ok()?.parse().ok()?;
+            let start = nl + 2;
+            let end = start.checked_add(len)?;
+            if buf.len() < end + 2 {
+                return None;
+            }
+            if index == 0 {
+                command = String::from_utf8_lossy(&buf[start..end]).to_uppercase();
+            }
+            pos = end + 2;
+        }
+        Some((command, pos))
+    }
+
+    /// Servidor RESP guionizado por conexion: setup (CLIENT) -> `+OK`,
+    /// PING -> `+PONG` y ROLE -> la respuesta indicada para esa conexion.
+    /// Cada `reset` del cliente abre una conexion nueva, de modo que el
+    /// indice de conexion selecciona el rol observado (replica o master).
+    fn spawn_role_server(role_replies: Vec<&'static [u8]>) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("bind server: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        let conn_seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let index = conn_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let role = role_replies
+                    .get(index)
+                    .copied()
+                    .or_else(|| role_replies.last().copied())
+                    .unwrap_or(ROLE_MASTER);
+                std::thread::spawn(move || {
+                    let mut pending: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        while let Some((command, consumed)) = take_resp_command(&pending) {
+                            pending.drain(..consumed);
+                            let reply: &[u8] = match command.as_str() {
+                                "PING" => b"+PONG\r\n",
+                                "ROLE" => role,
+                                _ => b"+OK\r\n",
+                            };
+                            if stream.write_all(reply).is_err() {
+                                return;
+                            }
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn cfg_with_url(url: &str) -> crate::consumer::config::ConsumerConfig {
+        let _guard = crate::consumer::config::test_env::lock();
+        std::env::remove_var("REDIS_SENTINEL_ADDRS");
+        std::env::remove_var("REDIS_MASTER_NAME");
+        std::env::set_var("REDIS_URL", url);
+        crate::consumer::config::ConsumerConfig::from_env()
+    }
+
+    fn client_for(url: &str) -> Arc<crate::consumer::redis_conn::RedisClient> {
+        let cfg = cfg_with_url(url);
+        Arc::new(
+            crate::consumer::redis_conn::RedisClient::new(&cfg)
+                .unwrap_or_else(|e| panic!("client: {e}")),
+        )
+    }
+
+    #[tokio::test]
+    async fn redis_ping_reintenta_tras_rol_replica_y_triunfa() {
+        // Primera conexion replica (master degradado); tras reset, master.
+        let addr = spawn_role_server(vec![ROLE_SLAVE, ROLE_MASTER]);
+        let client = client_for(&format!("redis://{addr}/"));
+        let res = Readiness::redis_ping(&client, Duration::from_secs(2)).await;
+        assert!(
+            res.is_ok(),
+            "tras re-resolver, el ROLE del master vigente debe triunfar: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_ping_falla_si_el_nodo_sigue_siendo_replica() {
+        // Ambas conexiones reportan replica: /readyz nunca debe dar ok.
+        let addr = spawn_role_server(vec![ROLE_SLAVE, ROLE_SLAVE]);
+        let client = client_for(&format!("redis://{addr}/"));
+        let res = Readiness::redis_ping(&client, Duration::from_secs(2)).await;
+        let err = match res {
+            Err(e) => e,
+            Ok(()) => panic!("un nodo replica nunca debe reportarse como master"),
+        };
+        assert!(
+            err.starts_with("redis:"),
+            "el error conserva el prefijo estable: {err}"
+        );
+        assert!(
+            !err.contains("redis://"),
+            "el error no filtra la URL: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_ping_sin_redis_falla_luego_de_reintentar() {
+        // Puerto cerrado: ambos intentos fallan y el error se reporta.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        drop(listener);
+        let cfg = cfg_with_url(&format!("redis://{addr}/"));
+        let client = Arc::new(
+            crate::consumer::redis_conn::RedisClient::new(&cfg)
+                .unwrap_or_else(|e| panic!("client: {e}")),
+        );
+        let res = Readiness::redis_ping(&client, Duration::from_millis(500)).await;
+        let err = match res {
+            Err(e) => e,
+            Ok(()) => panic!("sin Redis el chequeo debe fallar"),
+        };
+        assert!(
+            err.starts_with("redis:"),
+            "el error conserva el prefijo estable: {err}"
+        );
+        assert!(
+            !err.contains("redis://"),
+            "el error no filtra la URL: {err}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn str_ignora_claves_sentinel_incluida_auth() {
+        let _guard = crate::consumer::config::test_env::lock();
+        std::env::remove_var("REDIS_SENTINEL_ADDRS");
+        std::env::remove_var("REDIS_MASTER_NAME");
+        std::env::set_var("REDIS_SENTINEL_PASSWORD", "sentinel-secret");
+        let res: Result<(), String> = "redis://127.0.0.1:1/".readiness_client().map(|_| ());
+        assert!(res.is_ok(), "modo directo ignora la auth sentinel: {res:?}");
+        std::env::remove_var("REDIS_SENTINEL_PASSWORD");
     }
 }

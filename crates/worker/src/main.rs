@@ -74,8 +74,7 @@ async fn main() -> std::io::Result<()> {
     let minio = extraction_worker::objects::ObjectStoreSource::new(&s3)
         .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
     let readiness = std::sync::Arc::new(
-        http::Readiness::new(&cfg.redis_url, minio, documents.clone())
-            .map_err(std::io::Error::other)?,
+        http::Readiness::new(&cfg, minio, documents.clone()).map_err(std::io::Error::other)?,
     );
     let runner = ConsumerRunner::new(cfg, std::sync::Arc::new(pipeline), documents);
 

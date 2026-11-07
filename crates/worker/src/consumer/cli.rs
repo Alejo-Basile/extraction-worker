@@ -11,12 +11,14 @@ use serde_json::json;
 use super::config::ConsumerConfig;
 use super::dlq;
 use super::group::{self, is_nogroup};
+use super::redis_conn;
 use redis::aio::MultiplexedConnection;
 
 pub async fn inspect_pel() -> io::Result<()> {
     let cfg = ConsumerConfig::from_env();
-    let client =
-        redis::Client::open(cfg.redis_url.as_str()).map_err(|e| io::Error::other(e.to_string()))?;
+    // Fabrica T-07/T-08: en modo Sentinel resuelve el master vigente al
+    // invocar (comando de corta vida), en modo directo abre REDIS_URL.
+    let client = redis_conn::build_client(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut conn: MultiplexedConnection = client
         .get_multiplexed_async_connection()
         .await
@@ -55,8 +57,7 @@ pub async fn inspect_pel() -> io::Result<()> {
 pub async fn inspect_dlq(args: &[String]) -> io::Result<()> {
     let cfg = ConsumerConfig::from_env();
     let limit = inspect_limit(args)?;
-    let client =
-        redis::Client::open(cfg.redis_url.as_str()).map_err(|e| io::Error::other(e.to_string()))?;
+    let client = redis_conn::build_client(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let mut conn: MultiplexedConnection = client
         .get_multiplexed_async_connection()
         .await
