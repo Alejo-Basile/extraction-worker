@@ -33,6 +33,9 @@ fn now_millis() -> u128 {
 fn test_cfg(stream: &str) -> ConsumerConfig {
     ConsumerConfig {
         redis_url: test_url(),
+        redis_sentinel_addrs: Vec::new(),
+        redis_master_name: None,
+        redis_sentinel_password: None,
         stream: stream.to_string(),
         group: "it-group".to_string(),
         consumer_name: format!("it-consumer-{}", std::process::id()),
