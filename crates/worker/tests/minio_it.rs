@@ -152,17 +152,26 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
     // 4. El .txt esta en extracted-txt con texto del fixture.
     let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(txt_key.clone())).await);
     let bytes = must(got.bytes().await);
-    let text = String::from_utf8_lossy(&bytes).to_string();
+    let first_text = String::from_utf8_lossy(&bytes).to_string();
     assert!(
-        text.contains("Hello extraction"),
-        "el texto extraido debe contener el del fixture, obtuvo: {text:?}"
+        first_text.contains("Hello extraction"),
+        "el texto extraido debe contener el del fixture, obtuvo: {first_text:?}"
     );
 
-    // 5. Idempotencia (S2-P3-08): repetir el proceso deja un solo objeto.
+    // 5. Idempotencia (S2-P3-08): repetir el proceso deja un solo objeto con
+    // exactamente el mismo contenido; el put no acumula texto ni versiones.
     pipeline
         .process(&item)
         .await
         .unwrap_or_else(|e| panic!("reproceso idempotente debe triunfar: {e}"));
+
+    let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(txt_key.clone())).await);
+    let bytes = must(got.bytes().await);
+    let second_text = String::from_utf8_lossy(&bytes).to_string();
+    assert_eq!(
+        first_text, second_text,
+        "la segunda extraccion debe producir el mismo objeto"
+    );
 
     cleanup(&[raw, txt.clone()], &[&raw_key, &txt_key]).await;
 }

@@ -57,7 +57,7 @@ impl TextExtractor for PdfExtractor {
                 kind: ErrorKind::Business,
             });
         }
-        let text = pdf_extract::extract_text(pdf_path).map_err(|e| pdf_error(e, pdf_path))?;
+        let text = self.extract_text_safely(pdf_path)?;
         if text.trim().is_empty() {
             return Err(ExtractorError {
                 code: error_code::PDF_NO_TEXT.to_string(),
@@ -66,6 +66,29 @@ impl TextExtractor for PdfExtractor {
             });
         }
         Ok(text)
+    }
+}
+
+impl PdfExtractor {
+    /// Extrae texto sin dejar que un panic de la libreria rompa el job.
+    /// Los PDFs malformados son entrada no confiable: un panic se clasifica
+    /// como `PDF_CORRUPT` (negocio) y no como fallo de infraestructura.
+    fn extract_text_safely(&self, pdf_path: &Path) -> Result<String, ExtractorError> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text(pdf_path)
+        }));
+        match result {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(e)) => Err(pdf_error(e, pdf_path)),
+            Err(panic) => Err(ExtractorError {
+                code: error_code::PDF_CORRUPT.to_string(),
+                message: format!(
+                    "panic durante la extraccion: {panic:?} ({})",
+                    pdf_path.display()
+                ),
+                kind: ErrorKind::Business,
+            }),
+        }
     }
 }
 
