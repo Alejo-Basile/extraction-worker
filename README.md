@@ -24,6 +24,24 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
 - `Cargo.lock` **se commitea** (es aplicación, no librería).
 - `docs/adr/`: ADRs **locales** del servicio. Las ADRs **globales** viven en `infra/docs/adr/`.
 
+## Redis direct and Sentinel modes
+
+The default startup uses direct Redis and leaves Sentinel variables unset:
+
+```bash
+docker compose -f infra/compose/docker-compose.yml --env-file infra/.env --profile full up -d
+```
+
+To use Sentinel, activate both profiles and pass all three Sentinel addresses and the master name to the command. Do not store these variables in `infra/.env`, because that would enable Sentinel in direct mode too:
+
+```bash
+REDIS_SENTINEL_ADDRS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379 \
+REDIS_MASTER_NAME=myprimary \
+docker compose -f infra/compose/docker-compose.yml --env-file infra/.env --profile full --profile sentinel up -d
+```
+
+Compose leaves these variables unset by default. The entrypoint removes empty values before starting the worker and rejects incomplete pairs without logging them; `REDIS_URL` retains authentication and the direct-mode fallback.
+
 ## Escaneo de secretos (gitleaks, S0-P1-04)
 
 - **Local (primera capa):** instalar el hook de pre-commit **una vez** en este clone
