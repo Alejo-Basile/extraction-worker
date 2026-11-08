@@ -9,6 +9,7 @@ extraction-core = { path = "../core" }
 serde_json.workspace = true
 tokio.workspace = true
 actix-web.workspace = true
+actix-http.workspace = true
 serde.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = { workspace = true }
