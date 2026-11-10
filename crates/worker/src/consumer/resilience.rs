@@ -124,6 +124,24 @@ impl CircuitBreaker {
         }
     }
 
+    /// Cierto mientras el breaker rechaza por cooldown vigente (S6-P3-03):
+    /// `Open` con el plazo aun no vencido.
+    ///
+    /// `HalfOpen` NO cuenta: deja pasar el probe que decide si el breaker se
+    /// cierra o se reabre. El modo degradado del consumer usa este metodo y
+    /// no `is_open()` precisamente para no pausar el unico camino de
+    /// recuperacion.
+    pub fn rejecting(&self) -> bool {
+        match self.state.lock() {
+            Ok(st) => match *st {
+                CbState::Closed { .. } => false,
+                CbState::HalfOpen { .. } => false,
+                CbState::Open { until } => Instant::now() < until,
+            },
+            Err(_) => false,
+        }
+    }
+
     pub fn on_success(&self) {
         if let Ok(mut st) = self.state.lock() {
             *st = CbState::Closed { failures: 0 };
@@ -244,6 +262,27 @@ mod tests {
         assert!(cb.is_open(), "halfopen sigue degradado hasta el exito");
         cb.on_success();
         assert!(!cb.is_open());
+    }
+
+    /// S6-P3-03: el modo degradado debe pausar el consumo solo mientras el
+    /// cooldown rechaza de verdad; en `HalfOpen` el probe tiene que poder
+    /// pasar o el worker nunca recuperaria.
+    #[test]
+    fn rejecting_solo_durante_el_cooldown() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(50));
+        assert!(!cb.rejecting(), "cerrado no rechaza");
+
+        cb.on_failure();
+        assert!(cb.is_open());
+        assert!(cb.rejecting(), "abierto con cooldown vigente rechaza");
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!cb.rejecting(), "vencido el cooldown el probe debe pasar");
+        assert!(cb.allow(), "el probe entra en halfopen");
+        assert!(!cb.rejecting(), "halfopen no pausa el consumo");
+
+        cb.on_failure();
+        assert!(cb.rejecting(), "probe fallido reabre con cooldown nuevo");
     }
 
     #[test]

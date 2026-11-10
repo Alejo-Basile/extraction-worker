@@ -186,6 +186,29 @@ impl MasterConn {
     }
 }
 
+/// Frecuencia de reevaluacion del modo degradado (S6-P3-03): barata (un
+/// mutex local, sin red) y reacciona en cuanto vence el cooldown del
+/// breaker para dejar pasar el probe de recuperacion.
+const DEGRADED_PAUSE: Duration = Duration::from_secs(1);
+
+/// Dependencia de procesamiento con su breaker abierto por cooldown, si la
+/// hay (S6-P3-03). Redis queda fuera: sin Redis el read ya falla y reintentar
+/// es el unico camino; MinIO y Mongo son los que queman mensajes si se
+/// consumen degradados.
+///
+/// Usa `rejecting()` y no `is_open()`: en `HalfOpen` el probe debe pasar
+/// para cerrar el breaker; pausar el consumo en half-open mataria la unica
+/// via de recuperacion.
+fn degraded_dependency(minio: &CircuitBreaker, mongo: &CircuitBreaker) -> Option<&'static str> {
+    if minio.rejecting() {
+        Some("minio")
+    } else if mongo.rejecting() {
+        Some("mongo")
+    } else {
+        None
+    }
+}
+
 /// Contexto clonable que lleva cada tarea de procesamiento. La conexion se
 /// pasa por parametro (`Arc<MasterConn>`, re-resoluble): se establece una
 /// vez en `run()`. `Clone` es manual: los adaptadores `S`/`K` no son
@@ -368,7 +391,35 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         tx: mpsc::Sender<Vec<(String, HashMap<String, String>)>>,
         token: CancellationToken,
     ) {
+        // S6-P3-03 (modo degradado consciente): mientras una dependencia de
+        // procesamiento tenga su breaker abierto por cooldown, no se leen
+        // mensajes nuevos. Quedan en el stream (sin reclamar, sin delivery
+        // count) en vez de entregarse a jobs que fallarian igual y terminarian
+        // quemados por MAX_ATTEMPTS.
+        let mut degraded: Option<&'static str> = None;
         while !token.is_cancelled() {
+            if let Some(dep) = degraded_dependency(&ctx.pipeline.breaker(), &ctx.mongo_breaker) {
+                if degraded.is_none() {
+                    warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "modo degradado: consumo de mensajes nuevos pausado; quedan en el stream",
+                        dependency = dep
+                    );
+                    degraded = Some(dep);
+                }
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(DEGRADED_PAUSE) => {}
+                }
+                continue;
+            }
+            if let Some(dep) = degraded.take() {
+                info!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "modo degradado: consumo de mensajes nuevos reanudado",
+                    dependency = dep
+                );
+            }
             match Self::read_batch(&ctx, &rc).await {
                 Ok(batch) => {
                     if batch.is_empty() {
@@ -413,10 +464,34 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut cursor = "0-0".to_string();
         let mut jobs: JoinSet<()> = JoinSet::new();
+        // S6-P3-03: reclamar durante la caida solo haria crecer el delivery
+        // count de mensajes sanos hasta MAX_ATTEMPTS y los quemaria en la DLQ
+        // por un fallo de infraestructura. El reaper solo reanuda cuando el
+        // breaker dejo de rechazar (el probe pudo pasar).
+        let mut degraded = false;
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = ticker.tick() => {
+                    if degraded_dependency(&ctx.pipeline.breaker(), &ctx.mongo_breaker)
+                        .is_some()
+                    {
+                        if !degraded {
+                            degraded = true;
+                            warn!(
+                                service = crate::telemetry::SERVICE,
+                                msg = "modo degradado: xautoclaim pausado para no quemar delivery counts",
+                            );
+                        }
+                        continue;
+                    }
+                    if degraded {
+                        degraded = false;
+                        info!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "modo degradado: xautoclaim reanudado",
+                        );
+                    }
                     if let Err(e) = Self::do_autoclaim(&ctx, &rc, &mut cursor, &sem, &mut jobs).await {
                         warn!(
                             service = crate::telemetry::SERVICE,
@@ -453,6 +528,14 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             .max_concurrency
             .saturating_sub(sem.available_permits());
         metrics::gauge!("worker_inflight").set(in_flight as f64);
+        // Capacidad del bulkhead por instancia: la alerta de saturacion la
+        // compara contra `worker_inflight` sin hardcodear el limite.
+        metrics::gauge!("worker_bulkhead_capacity").set(ctx.cfg.max_concurrency as f64);
+        // S6-P3-03: 1 mientras el consumo esta pausado por un breaker con
+        // cooldown vigente (detalle de la dependencia en los logs y en
+        // `worker_breaker_open`).
+        let degraded = degraded_dependency(&ctx.pipeline.breaker(), &ctx.mongo_breaker).is_some();
+        metrics::gauge!("worker_degraded").set(f64::from(degraded));
         for (dependency, open) in [
             ("redis", ctx.redis_breaker.is_open()),
             ("mongo", ctx.mongo_breaker.is_open()),
@@ -1256,6 +1339,46 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    /// S6-P3-03: el modo degradado refleja los breakers de procesamiento,
+    /// con MinIO primero (es el caso de la tarea).
+    #[test]
+    fn modo_degradado_refleja_los_breakers_de_procesamiento() {
+        let minio = CircuitBreaker::new(1, Duration::from_secs(60));
+        let mongo = CircuitBreaker::new(1, Duration::from_secs(60));
+        assert_eq!(degraded_dependency(&minio, &mongo), None);
+
+        minio.on_failure();
+        assert_eq!(degraded_dependency(&minio, &mongo), Some("minio"));
+
+        mongo.on_failure();
+        assert_eq!(
+            degraded_dependency(&minio, &mongo),
+            Some("minio"),
+            "con ambos abiertos, minio es el que se reporta"
+        );
+
+        minio.on_success();
+        assert_eq!(degraded_dependency(&minio, &mongo), Some("mongo"));
+    }
+
+    /// S6-P3-03: un breaker en half-open NO degrada: el probe tiene que
+    /// pasar o el worker nunca recuperaria.
+    #[test]
+    fn half_open_no_cuenta_como_degradado() {
+        let minio = CircuitBreaker::new(1, Duration::from_millis(30));
+        let mongo = CircuitBreaker::new(1, Duration::from_secs(60));
+        minio.on_failure();
+        assert_eq!(degraded_dependency(&minio, &mongo), Some("minio"));
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(minio.allow(), "vencido el cooldown, el probe pasa");
+        assert_eq!(
+            degraded_dependency(&minio, &mongo),
+            None,
+            "half-open no pausa el consumo"
+        );
+    }
 
     #[tokio::test]
     async fn drain_espera_los_cortos_y_aborta_los_largos() {
