@@ -174,6 +174,12 @@ fn spawn_worker(port: u16, s3_endpoint: &str, stream: &str, group: &str) -> Chil
             .env("HTTP_PORT", port.to_string())
             .env("RUST_LOG", "off")
             .env("LOG_FORMAT", "text")
+            // El job `integration` de CI exporta vars de Sentinel para
+            // sentinel_it; el worker de este IT debe quedarse en modo directo
+            // (REDIS_URL), asi que se las quitamos al hijo.
+            .env_remove("REDIS_SENTINEL_ADDRS")
+            .env_remove("REDIS_MASTER_NAME")
+            .env_remove("REDIS_SENTINEL_PASSWORD")
             .env("REDIS_URL", test_url())
             .env("REDIS_STREAM", stream)
             .env("REDIS_GROUP", group)
