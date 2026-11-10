@@ -32,8 +32,17 @@ COPY crates ./crates
 # Los cache mounts evitan recompilar 13 minutos de dependencias en cada build.
 # `target/` es un cache mount (no queda en la capa), por eso el binario se copia
 # a /src, que si queda.
-RUN --mount=type=cache,target=/src/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# sharing=locked: con buildx multi-arch (amd64 + arm64 bajo QEMU) las dos
+# etapas corren EN PARALELO y comparten estos mounts. Con el default
+# `shared`, dos procesos `cargo` desempaquetan el mismo paquete a la vez y
+# el segundo muere con `failed to unpack package ... File exists (os
+# error 17)` sobre `.cargo-ok` (defecto medido en el build de main). Con
+# `locked`, la segunda arquitectura espera a que la primera libere el
+# cache: sin carrera en el registry y sin que ambas pisen el mismo
+# `target/release/extraction-worker`.
+RUN --mount=type=cache,target=/src/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release --locked --bin extraction-worker \
     && cp /src/target/release/extraction-worker /src/extraction-worker
 
