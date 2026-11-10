@@ -106,11 +106,13 @@ impl Readiness {
                 Self::redis_ping_only(&self.redis, self.redis_timeout).await
             }
         };
+        let group_check = Self::redis_group_check(&self.redis, self.redis_timeout);
         let minio_check = self.minio.check();
         let mongo_check = self.mongo.ping();
-        let (r, m, g) = tokio::join!(redis_check, minio_check, mongo_check,);
+        let (r, grp, m, g) = tokio::join!(redis_check, group_check, minio_check, mongo_check,);
         vec![
             ("redis", r),
+            ("redis_group", grp),
             ("minio", m.map_err(|e| e.to_string())),
             ("mongo", g.map_err(|e| e.to_string())),
         ]
@@ -212,6 +214,56 @@ impl Readiness {
             _ => String::new(),
         };
         Ok(role)
+    }
+
+    async fn redis_group_check(
+        redis: &Arc<redis_conn::RedisClient>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        const STREAM: &str = "stream:pdf-processing";
+        const GROUP: &str = "extraction-workers";
+        let mut conn = tokio::time::timeout(timeout, redis.connect())
+            .await
+            .map_err(|_| "redis: timeout conectando para group check".to_string())?
+            .map_err(|e| format!("redis: {e}"))?;
+        let groups: Vec<redis::Value> = tokio::time::timeout(
+            timeout,
+            redis::cmd("XINFO")
+                .arg("GROUPS")
+                .arg(STREAM)
+                .query_async(&mut conn),
+        )
+        .await
+        .map_err(|_| "redis: timeout en XINFO GROUPS".to_string())?
+        .map_err(|e| format!("redis: {e}"))?;
+        for g in groups {
+            if let redis::Value::Array(fields) = g {
+                // XINFO GROUPS devuelve pares clave/valor; la primera clave es name
+                let mut name = String::new();
+                let mut iter = fields.into_iter();
+                while let Some(k) = iter.next() {
+                    if let redis::Value::BulkString(kb) = k {
+                        if let Ok(kstr) = String::from_utf8(kb) {
+                            if kstr == "name" {
+                                if let Some(redis::Value::BulkString(vb)) = iter.next() {
+                                    name = String::from_utf8_lossy(&vb).to_string();
+                                    break;
+                                }
+                            } else {
+                                // saltar valor
+                                let _ = iter.next();
+                            }
+                        }
+                    }
+                }
+                if name == GROUP {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!(
+            "redis: consumer group {GROUP} no encontrado en {STREAM}"
+        ))
     }
 }
 
