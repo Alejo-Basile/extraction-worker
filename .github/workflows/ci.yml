@@ -207,3 +207,24 @@ jobs:
           MONGO_WORKER_URI: mongodb://worker:worker-dev-secret@127.0.0.1:27017/app?authSource=app&directConnection=true
           MONGO_TEST_ROOT_URI: mongodb://root:worker-dev-root@127.0.0.1:27017/?directConnection=true
         run: cargo test --all-features -- --ignored
+
+  image-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: extraction-worker:ci
+      - name: scan image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: extraction-worker:ci
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
