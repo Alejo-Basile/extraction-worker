@@ -6,9 +6,9 @@
 //! - descriptores abiertos desde `/proc/<pid>/fd`,
 //! - gauges del worker desde `/metrics` (inflight, stream depth, PEL).
 //!
-//! Criterios: RSS estable despues del calentamiento (primeros 100
-//! completados como linea base, delta < 128 MiB), descriptores constantes
-//! (+-3) entre esa linea base y el final, todo COMPLETED y DLQ vacia.
+//! Criterios: RSS estable despues del calentamiento (el primer cuarto de las
+//! muestras como linea base, delta < 128 MiB), descriptores constantes (+-3)
+//! entre esa linea base y el final, todo COMPLETED y DLQ vacia.
 //!
 //! Requiere el stack de labs:
 //! `cd labs && cp .env.example .env && docker compose up -d`
@@ -31,7 +31,6 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 const DOCS: usize = 1000;
-const WARMUP: usize = 100;
 const RSS_DELTA_LIMIT_MIB: i64 = 128;
 const FD_DELTA_LIMIT: i64 = 3;
 
@@ -387,7 +386,7 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         "el worker no arranco en 10s"
     );
 
-    // Muestreo cada ~500ms hasta completar los 1000 (o 600s de tope).
+    // Muestreo cada 250ms hasta completar los 1000 (o 600s de tope).
     let started = Instant::now();
     let mut samples: Vec<Sample> = Vec::new();
     let mut completed = 0u64;
@@ -408,7 +407,7 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
             cpu_ticks: cpu_ticks(pid).unwrap_or(-1),
         });
         tick += 1;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let total_elapsed = started.elapsed();
 
@@ -417,24 +416,24 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         "deben completarse los {DOCS} documentos; quedaron {completed} en {total_elapsed:?}"
     );
 
-    // Linea base: el primer tramo hasta 100 completados (calentamiento de
-    // pools, buffers y cache de pdf-extract).
-    let warm: Vec<&Sample> = samples
-        .iter()
-        .filter(|s| s.completed <= WARMUP as u64)
-        .collect();
-    let warm_span = warm.last().map(|s| s.elapsed).unwrap_or(Duration::ZERO);
+    // Linea base: el primer cuarto de las muestras (calentamiento de pools,
+    // buffers y cache de pdf-extract). En hosts rapidos los 1000 documentos
+    // pueden terminar en ~10s, asi que la ventana se define por muestras y no
+    // por cantidad de completados.
     assert!(
-        warm.len() >= 3,
-        "el muestreo debe cubrir el calentamiento (muestras: {}, tramo: {warm_span:?})",
-        warm.len()
+        samples.len() >= 8,
+        "muy pocas muestras ({}) para evaluar sostenimiento",
+        samples.len()
     );
-    let baseline_rss = warm.iter().map(|s| s.rss_kib).max().unwrap_or(0);
-    let baseline_fds = warm.last().map(|s| s.fds).unwrap_or(0);
-    let after: Vec<&Sample> = samples
+    let warm_count = (samples.len() / 4).max(3);
+    let warm_span = samples[warm_count - 1].elapsed;
+    let baseline_rss = samples[..warm_count]
         .iter()
-        .filter(|s| s.completed > WARMUP as u64)
-        .collect();
+        .map(|s| s.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let baseline_fds = samples[warm_count - 1].fds;
+    let after = &samples[warm_count..];
     let peak_rss = after.iter().map(|s| s.rss_kib).max().unwrap_or(0);
     let final_fds = samples.last().map(|s| s.fds).unwrap_or(0);
     let final_rss = samples.last().map(|s| s.rss_kib).unwrap_or(0);
@@ -452,9 +451,10 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
     let fd_delta = final_fds - baseline_fds;
 
     eprintln!(
-        "sostenimiento: docs={DOCS} muestras={} tiempo={:.1}s rss_base={:.1}MiB \
-         rss_pico={:.1}MiB rss_final={:.1}MiB delta_pico={:.1}MiB fds_base={} fds_final={} \
-         delta_fds={} cpu={:.1}s",
+        "sostenimiento: docs={DOCS} completados={} muestras={} tiempo={:.1}s \
+         calentamiento={warm_span:?} rss_base={:.1}MiB rss_pico={:.1}MiB rss_final={:.1}MiB \
+         delta_pico={:.1}MiB fds_base={} fds_final={} delta_fds={} cpu={:.1}s",
+        samples.last().map(|s| s.completed).unwrap_or(0),
         samples.len(),
         total_elapsed.as_secs_f64(),
         baseline_rss as f64 / 1024.0,

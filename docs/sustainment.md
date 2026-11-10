@@ -12,7 +12,7 @@ real contra el stack de labs y procesa **1000 documentos** con tamaños mixtos
 que el corpus de S5-P3-05), se siembran en MinIO y los documentos en Mongo como
 `QUEUED`; luego se emiten 1000 mensajes al stream.
 
-Durante la corrida se muestrea cada ~500 ms:
+Durante la corrida se muestrea cada 250 ms:
 
 | Señal | Fuente |
 |---|---|
@@ -26,22 +26,24 @@ Configuración del worker en el test: `WORKER_BATCH_COUNT=10`,
 
 ## Criterios y resultado
 
-Los primeros 100 completados definen la línea base (calentamiento de pools,
-buffers y caché de `pdf-extract`); lo que importa es el crecimiento **después**
-de esa línea base.
+El **primer cuarto de las muestras** define la línea base (calentamiento de
+pools, buffers y caché de `pdf-extract`); lo que importa es el crecimiento
+**después** de esa línea base. La ventana se define por muestras y no por
+cantidad de completados porque en un host rápido los 1000 documentos pueden
+terminar en ~10 s.
 
 | Criterio | Umbral | Medido (labs local) |
 |---|---|---|
 | Documentos completados | 1000/1000 | 1000/1000 |
-| Delta de RSS pico vs línea base | < 128 MiB | **3.1 MiB** |
-| RSS final vs pico | estable | 52.0 MiB = 52.0 MiB |
+| Delta de RSS pico vs línea base | < 128 MiB | **3.2 MiB** |
+| RSS final vs pico | estable | 53.3 MiB = 53.3 MiB |
 | Delta de descriptores (base → final) | ±3 | **0** (59 → 59) |
 | DLQ | vacía | `XLEN = 0` |
 | PEL | drenada | `worker_pel_pending = 0` |
 
-Referencia de la corrida: 1000 documentos en **21.6 s** de pared (41 muestras),
-con **65.5 s** de CPU acumulada (4 extracciones concurrentes). RSS: base
-48.8 MiB, pico 52.0 MiB.
+Referencia de la corrida: 1000 documentos en **14.4 s** de pared (54 muestras
+cada 250 ms), con **44.1 s** de CPU acumulada (4 extracciones concurrentes).
+RSS: base 50.1 MiB, pico 53.3 MiB.
 
 La memoria se estabiliza tras el calentamiento y no vuelve a crecer con el
 volumen: no se observó fuga. Los descriptores quedan constantes: no se filtran
