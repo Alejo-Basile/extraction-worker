@@ -42,6 +42,39 @@ docker compose -f infra/compose/docker-compose.yml --env-file infra/.env --profi
 
 Compose leaves these variables unset by default. The entrypoint removes empty values before starting the worker and rejects incomplete pairs without logging them; `REDIS_URL` retains authentication and the direct-mode fallback.
 
+## Imagen Docker
+
+Build local (multi-stage; runtime fijo por digest):
+
+```bash
+docker build -t extraction-worker:local .
+```
+
+La imagen corre como usuario no-root `10001:10001`, expone `8081` y define un
+`HEALTHCHECK` contra `/healthz`:
+
+```bash
+docker image inspect extraction-worker:local \
+  --format 'user={{.Config.User}} health={{json .Config.Healthcheck}}'
+```
+
+Con el stack de labs arriba (Redis, MinIO y Mongo), `/healthz` y `/readyz`
+deben responder `200`; al destruir el consumer group, `/readyz` debe responder
+`503` (P3-CLOSE-03):
+
+```bash
+curl -fsS http://127.0.0.1:8081/healthz              # {"status":"ok"}
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8081/readyz                        # 200
+
+redis-cli XGROUP DESTROY stream:pdf-processing extraction-workers
+curl -s http://127.0.0.1:8081/readyz                  # 503: redis_group no encontrado
+```
+
+Evidencia de la verificación (2026-11-12): build OK, `uid=10001(worker)`,
+healthcheck `healthy`, `/healthz` 200, `/readyz` 200 con el stack sano y `503`
+sin el grupo `extraction-workers`.
+
 ## Escaneo de secretos (gitleaks, S0-P1-04)
 
 - **Local (primera capa):** instalar el hook de pre-commit **una vez** en este clone
@@ -59,8 +92,9 @@ Compose leaves these variables unset by default. The entrypoint removes empty va
 
 - **`/healthz`**: el proceso está vivo (liveness, sin tocar dependencias).
 - **`/readyz`**: verifica dependencias reales en paralelo — `PING` a Redis,
-  `head` de una clave sonda en MinIO y `PING` a Mongo. Responde `200` si las
-  tres están OK y `503` con el detalle por dependencia.
+  `XINFO GROUPS` del consumer group `extraction-workers`, `head` de una clave
+  sonda en MinIO y `PING` a Mongo. Responde `200` si todas están OK y `503`
+  con el detalle por dependencia.
 - **`/metrics`**: exposición Prometheus. Etiquetas de baja cardinalidad
   (ruta/estado); nunca `document_id`, `correlation_id` ni `object_key`.
 - **Logs estructurados**: JSON a stdout por defecto con `timestamp`, `level`,
