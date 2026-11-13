@@ -49,10 +49,7 @@ pub trait ReadinessRedis {
     /// defecto los valores historicos; `&ConsumerConfig` los toma de la
     /// configuracion (`REDIS_STREAM`/`REDIS_GROUP`).
     fn stream_group(&self) -> (String, String) {
-        (
-            "stream:pdf-processing".to_string(),
-            "extraction-workers".to_string(),
-        )
+        (READYZ_STREAM.to_string(), READYZ_GROUP.to_string())
     }
 }
 
@@ -450,13 +447,18 @@ mod tests {
 
     #[actix_web::test]
     async fn readyz_group_check_usa_stream_y_group_de_config() -> Result<(), String> {
-        let _guard = crate::consumer::config::test_env::lock();
-        std::env::remove_var("REDIS_SENTINEL_ADDRS");
-        std::env::remove_var("REDIS_MASTER_NAME");
-        std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
-        std::env::set_var("REDIS_STREAM", "stream:custom");
-        std::env::set_var("REDIS_GROUP", "group-custom");
-        let cfg = ConsumerConfig::from_env();
+        // El guard se suelta antes del await: despues de `from_env()` la
+        // configuracion es un valor propio y no se vuelve a leer el entorno
+        // (clippy::await_holding_lock).
+        let cfg = {
+            let _guard = crate::consumer::config::test_env::lock();
+            std::env::remove_var("REDIS_SENTINEL_ADDRS");
+            std::env::remove_var("REDIS_MASTER_NAME");
+            std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
+            std::env::set_var("REDIS_STREAM", "stream:custom");
+            std::env::set_var("REDIS_GROUP", "group-custom");
+            ConsumerConfig::from_env()
+        };
         let readiness = readiness_with(&cfg).await?;
         assert_eq!(
             readiness.stream_group(),
