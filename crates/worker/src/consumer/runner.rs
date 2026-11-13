@@ -531,6 +531,15 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // Capacidad del bulkhead por instancia: la alerta de saturacion la
         // compara contra `worker_inflight` sin hardcodear el limite.
         metrics::gauge!("worker_bulkhead_capacity").set(ctx.cfg.max_concurrency as f64);
+        // H-03: uso de pids del cgroup frente al limite (panel de recursos).
+        // Sin etiquetas: el dashboard consulta los nombres pelados. Si el
+        // cgroup no se puede leer, no se publica ningun valor inventado.
+        if let Some(usage) = super::cgroup::pids_usage() {
+            metrics::gauge!("worker_pids_current").set(usage.current as f64);
+            if let Some(limit) = usage.limit {
+                metrics::gauge!("worker_pids_limit").set(limit as f64);
+            }
+        }
         // S6-P3-03: 1 mientras el consumo esta pausado por un breaker con
         // cooldown vigente (detalle de la dependencia en los logs y en
         // `worker_breaker_open`).
