@@ -371,3 +371,79 @@ async fn healthz_responde_durante_timeout_de_job() {
         other => panic!("debe morir por timeout, obtuvo: {other:?}"),
     }
 }
+
+/// Envuelve el extractor lento y cuenta sus invocaciones con un contador
+/// compartido, sin modificar `SlowExtractor` (la prueba de liveness la
+/// sigue usando intacta).
+struct CountingSlowExtractor {
+    inner: SlowExtractor,
+    calls: std::sync::Arc<AtomicU32>,
+}
+
+impl TextExtractor for CountingSlowExtractor {
+    fn extract(&self, path: &Path) -> Result<String, extraction_core::ExtractorError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.extract(path)
+    }
+}
+
+#[actix_web::test]
+async fn job_timeout_devuelve_transitorio() {
+    const KEY: &str = "raw-pdfs/hostil-lento-timeout.pdf";
+    let source = InMemorySource::with_file(KEY, b"%PDF-1.4".to_vec());
+    let sink = InMemorySink::default();
+    let written = sink.files.clone();
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    let pipeline = ExtractionPipeline::new(
+        std::sync::Arc::new(source),
+        std::sync::Arc::new(sink),
+        std::sync::Arc::new(CountingSlowExtractor {
+            inner: SlowExtractor {
+                delay: Duration::from_millis(300),
+                calls: AtomicU32::new(0),
+            },
+            calls: std::sync::Arc::clone(&calls),
+        }),
+        std::sync::Arc::new(CircuitBreaker::default()),
+        PipelineLimits {
+            job_timeout: Duration::from_millis(50),
+            s3_op_timeout: Duration::from_secs(1),
+            max_pdf_bytes: 1024,
+            max_output_bytes: 1024,
+        },
+    );
+    let item = extraction_core::WorkItem {
+        document_id: "hostil-lento".to_string(),
+        object_key: KEY.to_string(),
+        correlation_id: "hostil-lento".to_string(),
+        enqueued_at: "2026-11-30T10:15:03Z".to_string(),
+        schema_version: 1,
+    };
+
+    match pipeline.process(&item).await {
+        Err(Failure::Transient { code, .. }) => assert_eq!(code, "JOB_TIMEOUT"),
+        other => panic!("debe morir por timeout, obtuvo: {other:?}"),
+    }
+
+    // El extractor corre en un hilo bloqueante: al vencer el timeout el
+    // contador ya fue incrementado, pero se espera acotado por si la
+    // planificacion se atrasa.
+    for _ in 0..50 {
+        if calls.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "el extractor lento debe haber entrado exactamente una vez"
+    );
+
+    // Un job en timeout no escribe el .txt: el pipeline falla y no hay ACK.
+    let files = written.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        files.is_empty(),
+        "un job en timeout no debe escribir el .txt: {files:?}"
+    );
+}
