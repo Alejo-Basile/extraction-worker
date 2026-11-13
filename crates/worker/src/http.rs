@@ -40,6 +40,16 @@ pub trait ReadinessRedis {
     fn readiness_checks_master(&self) -> bool {
         false
     }
+
+    /// Stream y consumer group que `/readyz` debe validar (H-07). Por
+    /// defecto los valores historicos; `&ConsumerConfig` los toma de la
+    /// configuracion (`REDIS_STREAM`/`REDIS_GROUP`).
+    fn stream_group(&self) -> (String, String) {
+        (
+            "stream:pdf-processing".to_string(),
+            "extraction-workers".to_string(),
+        )
+    }
 }
 
 fn client_from_cfg(cfg: &ConsumerConfig) -> Result<Arc<redis_conn::RedisClient>, String> {
@@ -55,6 +65,10 @@ impl ReadinessRedis for &ConsumerConfig {
 
     fn readiness_checks_master(&self) -> bool {
         true
+    }
+
+    fn stream_group(&self) -> (String, String) {
+        (self.stream.clone(), self.group.clone())
     }
 }
 
@@ -79,6 +93,9 @@ pub struct Readiness {
     mongo: Arc<DocumentStore>,
     redis_timeout: Duration,
     redis_checks_master: bool,
+    /// Stream y grupo configurados (H-07): el group check no usa constantes.
+    stream: String,
+    group: String,
 }
 
 impl Readiness {
@@ -88,13 +105,22 @@ impl Readiness {
         mongo: Arc<DocumentStore>,
     ) -> Result<Self, String> {
         let redis_checks_master = redis.readiness_checks_master();
+        let (stream, group) = redis.stream_group();
         Ok(Self {
             redis: redis.readiness_client()?,
             minio,
             mongo,
             redis_timeout: Duration::from_secs(2),
             redis_checks_master,
+            stream,
+            group,
         })
+    }
+
+    /// Stream y consumer group que valida `/readyz`. Test y diagnostico.
+    #[allow(dead_code)]
+    pub(crate) fn stream_group(&self) -> (&str, &str) {
+        (&self.stream, &self.group)
     }
 
     /// Chequeos en paralelo; cada uno con su propio timeout acotado.
@@ -106,7 +132,8 @@ impl Readiness {
                 Self::redis_ping_only(&self.redis, self.redis_timeout).await
             }
         };
-        let group_check = Self::redis_group_check(&self.redis, self.redis_timeout);
+        let group_check =
+            Self::redis_group_check(&self.redis, self.redis_timeout, &self.stream, &self.group);
         let minio_check = self.minio.check();
         let mongo_check = self.mongo.ping();
         let (r, grp, m, g) = tokio::join!(redis_check, group_check, minio_check, mongo_check,);
@@ -219,9 +246,9 @@ impl Readiness {
     async fn redis_group_check(
         redis: &Arc<redis_conn::RedisClient>,
         timeout: Duration,
+        stream: &str,
+        group: &str,
     ) -> Result<(), String> {
-        const STREAM: &str = "stream:pdf-processing";
-        const GROUP: &str = "extraction-workers";
         let mut conn = tokio::time::timeout(timeout, redis.connect())
             .await
             .map_err(|_| "redis: timeout conectando para group check".to_string())?
@@ -230,7 +257,7 @@ impl Readiness {
             timeout,
             redis::cmd("XINFO")
                 .arg("GROUPS")
-                .arg(STREAM)
+                .arg(stream)
                 .query_async(&mut conn),
         )
         .await
@@ -256,13 +283,13 @@ impl Readiness {
                         }
                     }
                 }
-                if name == GROUP {
+                if name == group {
                     return Ok(());
                 }
             }
         }
         Err(format!(
-            "redis: consumer group {GROUP} no encontrado en {STREAM}"
+            "redis: consumer group {group} no encontrado en {stream}"
         ))
     }
 }
@@ -303,7 +330,11 @@ pub async fn readyz(readiness: web::Data<Readiness>) -> impl Responder {
 // el identificador con la crate `metrics`.
 #[get("/metrics")]
 pub async fn metrics_handler(handle: web::Data<PrometheusHandle>) -> impl Responder {
-    HttpResponse::Ok().body(handle.render())
+    // H-02: Prometheus v3.16 rechaza el scrape sin Content-Type; el formato
+    // de texto 0.0.4 es el que espera el job `extraction-worker`.
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(handle.render())
 }
 
 /// Middleware de metricas HTTP. Etiquetas de baja cardinalidad
@@ -336,14 +367,7 @@ mod tests {
     /// App de prueba identica a la del binario. Macro para no declarar el
     /// tipo complejo del ServiceFactory.
     /// Readiness apuntando a puertos muertos: /readyz debe responder 503.
-    async fn dead_readiness() -> Result<Readiness, String> {
-        let cfg = {
-            let _guard = crate::consumer::config::test_env::lock();
-            std::env::remove_var("REDIS_SENTINEL_ADDRS");
-            std::env::remove_var("REDIS_MASTER_NAME");
-            std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
-            crate::consumer::config::ConsumerConfig::from_env()
-        };
+    async fn readiness_with(cfg: &ConsumerConfig) -> Result<Readiness, String> {
         let s3 = crate::objects::S3Config {
             endpoint: "http://127.0.0.1:1".to_string(),
             bucket_raw: "raw-pdfs".to_string(),
@@ -361,7 +385,18 @@ mod tests {
             })
             .await
             .map_err(|e| e.to_string())?;
-        Readiness::new(&cfg, minio, Arc::new(mongo))
+        Readiness::new(cfg, minio, Arc::new(mongo))
+    }
+
+    async fn dead_readiness() -> Result<Readiness, String> {
+        let cfg = {
+            let _guard = crate::consumer::config::test_env::lock();
+            std::env::remove_var("REDIS_SENTINEL_ADDRS");
+            std::env::remove_var("REDIS_MASTER_NAME");
+            std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
+            crate::consumer::config::ConsumerConfig::from_env()
+        };
+        readiness_with(&cfg).await
     }
 
     macro_rules! test_app {
@@ -406,6 +441,52 @@ mod tests {
                 "el check {dep} debe reportar error: {json}"
             );
         }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn readyz_group_check_usa_stream_y_group_de_config() -> Result<(), String> {
+        let _guard = crate::consumer::config::test_env::lock();
+        std::env::remove_var("REDIS_SENTINEL_ADDRS");
+        std::env::remove_var("REDIS_MASTER_NAME");
+        std::env::set_var("REDIS_URL", "redis://127.0.0.1:1/");
+        std::env::set_var("REDIS_STREAM", "stream:custom");
+        std::env::set_var("REDIS_GROUP", "group-custom");
+        let cfg = ConsumerConfig::from_env();
+        let readiness = readiness_with(&cfg).await?;
+        assert_eq!(
+            readiness.stream_group(),
+            ("stream:custom", "group-custom"),
+            "H-07: /readyz debe validar el stream y el grupo configurados"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn str_mantiene_stream_y_group_por_defecto() {
+        let (stream, group) = "redis://127.0.0.1:1/".stream_group();
+        assert_eq!(
+            (stream.as_str(), group.as_str()),
+            ("stream:pdf-processing", "extraction-workers"),
+            "el camino &str conserva los valores historicos"
+        );
+    }
+
+    #[actix_web::test]
+    async fn metrics_declara_content_type_de_prometheus() -> Result<(), String> {
+        let app = test_app!()?;
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .ok_or_else(|| {
+                "la respuesta de /metrics debe declarar Content-Type (H-02)".to_string()
+            })?
+            .to_str()
+            .map_err(|e| format!("Content-Type no es ASCII: {e}"))?;
+        assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
         Ok(())
     }
 
