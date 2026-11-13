@@ -19,6 +19,10 @@ use crate::consumer::redis_conn;
 use crate::document_store::DocumentStore;
 use crate::objects::ObjectStoreSource;
 
+/// Stream y consumer group que `/readyz` valida en produccion (S1-P3-02).
+const READYZ_STREAM: &str = "stream:pdf-processing";
+const READYZ_GROUP: &str = "extraction-workers";
+
 #[get("/healthz")]
 pub async fn healthz() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
@@ -614,6 +618,73 @@ mod tests {
             crate::consumer::redis_conn::RedisClient::new(&cfg)
                 .unwrap_or_else(|e| panic!("client: {e}")),
         )
+    }
+
+    fn redis_test_url() -> String {
+        std::env::var("REDIS_TEST_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string())
+    }
+
+    #[tokio::test]
+    #[ignore = "requiere Redis real (REDIS_TEST_URL)"]
+    async fn redis_group_check_detecta_grupo_ausente_y_presente() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let url = redis_test_url();
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let stream = format!("it:readyz:group:{}:{millis}", std::process::id());
+        let group = "it-readyz-group";
+        let client = client_for(&url);
+        let raw = redis::Client::open(url.as_str())
+            .unwrap_or_else(|e| panic!("cliente Redis para el test: {e}"));
+        let mut conn = raw
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap_or_else(|e| panic!("conexion Redis para el test: {e}"));
+
+        let _: redis::Value = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("XGROUP CREATE: {e}"));
+
+        let present =
+            Readiness::redis_group_check(&client, Duration::from_secs(2), &stream, group).await;
+        assert!(
+            present.is_ok(),
+            "con el grupo creado el check debe dar ok: {present:?}"
+        );
+
+        let _: redis::Value = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(&stream)
+            .arg(group)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("XGROUP DESTROY: {e}"));
+
+        let absent =
+            Readiness::redis_group_check(&client, Duration::from_secs(2), &stream, group).await;
+        let err = match absent {
+            Err(e) => e,
+            Ok(()) => panic!("sin el grupo el check debe fallar"),
+        };
+        assert!(
+            err.contains("no encontrado"),
+            "el error debe explicar que falta el grupo: {err}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&stream)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("DEL del stream de prueba: {e}"));
     }
 
     #[tokio::test]
