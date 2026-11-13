@@ -1,0 +1,93 @@
+---
+# Publica la imagen del worker en GitHub Container Registry (GHCR).
+#
+# Por que existe: la infraestructura despliega el worker fijando la imagen por
+# digest, como `${EXTRACTION_WORKER_IMAGE}:${EXTRACTION_WORKER_TAG}@${DIGEST}`
+# (ver infra `compose/docker-compose.yml`). Sin una imagen publicada no hay
+# digest que fijar. Este workflow construye la imagen multi-arch y la sube a
+# `ghcr.io/alejo-basile/extraction-worker`.
+#
+# El label OCI `org.opencontainers.image.revision` es lo que lee la infra con
+# `docker inspect` para verificar que la revision desplegada coincide con el
+# commit; por eso se fija explicitamente a `${{ github.sha }}`.
+name: publish-image
+
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Un push nuevo al mismo ref cancela la publicacion anterior todavia en curso.
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU habilita la emulacion de linux/arm64 sobre el runner amd64.
+      - name: setup qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Autenticacion contra GHCR con el token efimero del workflow.
+      - name: login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Politica de tags: sha corto siempre; latest solo en main; semver en
+      # tags v*. El nombre se fuerza en minusculas para GHCR.
+      - name: metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/alejo-basile/extraction-worker
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=extraction-worker
+            org.opencontainers.image.description=Worker de extraccion de PDFs
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # El digest queda en el resumen del job para que un operador lo fije.
+      - name: print image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## Imagen publicada"
+            echo ""
+            echo '```'
+            echo "ghcr.io/alejo-basile/extraction-worker@${IMAGE_DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
