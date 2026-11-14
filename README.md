@@ -108,7 +108,8 @@ sin el grupo `extraction-workers`.
   `worker_stream_depth{stream}`, `worker_pel_pending{group}`,
   `worker_dlq_depth{stream}`, `worker_dlq_oldest_age_seconds{stream}`,
   `worker_dead_consumers{group}`, `worker_s3_seconds{operation,outcome}`,
-  `worker_shutdown_seconds` y `worker_shutdown_aborted_total`. Los gauges de
+  `worker_pids_current`, `worker_pids_limit`, `worker_shutdown_seconds` y
+  `worker_shutdown_aborted_total`. Los gauges de
   cola se refrescan cada `WORKER_METRICS_INTERVAL_SECS` (default `15`).
 - **Apagado**: `SIGTERM`/`SIGINT` cancelan el consumer y drenan HTTP y consumer
   en paralelo con un presupuesto único de 6s. Los jobs en vuelo tienen

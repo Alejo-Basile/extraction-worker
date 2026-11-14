@@ -8,7 +8,7 @@ use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
     get,
     middleware::Next,
-    web, Error, HttpResponse, Responder,
+    route, web, Error, HttpResponse, Responder,
 };
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -329,7 +329,7 @@ pub async fn readyz(readiness: web::Data<Readiness>) -> impl Responder {
 
 // El handler se llama metrics_handler (no `metrics`) para no ambiguar
 // el identificador con la crate `metrics`.
-#[get("/metrics")]
+#[route("/metrics", method = "GET", method = "HEAD")]
 pub async fn metrics_handler(handle: web::Data<PrometheusHandle>) -> impl Responder {
     // H-02: Prometheus v3.16 rechaza el scrape sin Content-Type; el formato
     // de texto 0.0.4 es el que espera el job `extraction-worker`.
@@ -489,6 +489,27 @@ mod tests {
             .get(actix_web::http::header::CONTENT_TYPE)
             .ok_or_else(|| {
                 "la respuesta de /metrics debe declarar Content-Type (H-02)".to_string()
+            })?
+            .to_str()
+            .map_err(|e| format!("Content-Type no es ASCII: {e}"))?;
+        assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn metrics_responde_head_con_content_type() -> Result<(), String> {
+        let app = test_app!()?;
+        let req = test::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri("/metrics")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .ok_or_else(|| {
+                "la respuesta HEAD de /metrics debe declarar Content-Type (H-02)".to_string()
             })?
             .to_str()
             .map_err(|e| format!("Content-Type no es ASCII: {e}"))?;
