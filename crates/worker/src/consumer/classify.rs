@@ -27,6 +27,8 @@ pub const FAILOVER_CODE: &str = "REDIS_FAILOVER";
 /// Codigo de `Failure` para errores de socket (`Io`/`Client`).
 pub const IO_CODE: &str = "REDIS_IO";
 
+pub const STALL_CODE: &str = "REDIS_STALL";
+
 /// `true` si la falla clasificada es un failover de Sentinel: el caller
 /// debe descartar la conexion, `RedisClient::reset()` y reconectar.
 pub fn is_failover_failure(f: &Failure) -> bool {
@@ -42,7 +44,10 @@ pub fn is_failover_failure(f: &Failure) -> bool {
 ///   `MultiplexedConnection` no se auto-repara: sin reconnect cada retry
 ///   falla igual y el breaker se abre sin recuperacion posible.
 pub fn needs_reconnect(f: &Failure) -> bool {
-    is_failover_failure(f) || matches!(f, Failure::Transient { code, .. } if code == IO_CODE)
+    is_failover_failure(f)
+        || matches!(f, Failure::Transient { code, .. } if code == IO_CODE)
+        || matches!(f, Failure::Transient { code, .. } if code == STALL_CODE)
+        || matches!(f, Failure::Transient { code, .. } if code == "REDIS_TIMEOUT")
 }
 
 pub fn classify_redis_error(e: &RedisError) -> Failure {
@@ -213,9 +218,8 @@ mod tests {
         assert!(needs_reconnect(&broken), "Io requiere reconectar");
 
         // El resto conserva el comportamiento anterior (retry sobre la
-        // misma conexion): timeouts, NOGROUP, fatales y documentos.
+        // misma conexion): NOGROUP, fatales y documentos.
         for f in [
-            Failure::transient(REDIS_TIMEOUT_CODE_TEST, "xack timeout"),
             classify_redis_error(&RedisError::from((
                 ErrorKind::Server(ServerErrorKind::ResponseError),
                 "NOGROUP",
@@ -231,4 +235,16 @@ mod tests {
     }
 
     const REDIS_TIMEOUT_CODE_TEST: &str = "REDIS_TIMEOUT";
+
+    #[test]
+    fn needs_reconnect_cubre_stall_del_read_bloqueante() {
+        assert!(
+            needs_reconnect(&Failure::transient(STALL_CODE, "xreadgroup timeout")),
+            "STALL requiere reconectar"
+        );
+        assert!(
+            needs_reconnect(&Failure::transient(REDIS_TIMEOUT_CODE_TEST, "xack timeout")),
+            "REDIS_TIMEOUT reconecta"
+        );
+    }
 }

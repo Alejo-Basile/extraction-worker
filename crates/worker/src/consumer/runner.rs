@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use extraction_core::error_code::MAX_ATTEMPTS_EXCEEDED;
 use extraction_core::{ErrorKind, WorkItem};
@@ -40,11 +40,11 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::document_store::{mongo_breaker, DocumentStore};
 
-use super::classify::{classify_redis_error, needs_reconnect};
+use super::classify::{classify_redis_error, needs_reconnect, IO_CODE, STALL_CODE};
 use super::config::ConsumerConfig;
 use super::dlq::{self, best_effort_item, contract_cause};
 use super::group;
@@ -75,6 +75,14 @@ const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// trabajo en memoria.
 const READ_QUEUE: usize = 32;
 const REDIS_TIMEOUT_CODE: &str = "REDIS_TIMEOUT";
+
+/// Cota dura de una re-resolucion + reconexion completa. Si vence, el caller
+/// la trata como fallo transitorio y reintenta; el reader nunca queda clavado.
+const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cada cuanto, en modo Sentinel, el reader verifica que sigue apuntando al
+/// master vigente aunque ninguna operacion haya fallado (watchdog).
+const MASTER_RECHECK_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Conexion al master actual con re-resolucion ante failover (T-08).
 ///
@@ -139,22 +147,40 @@ impl MasterConn {
         }
     }
 
-    /// Re-resuelve el master via la fabrica (`reset`, en hilo bloqueante:
-    /// en Sentinel la fabrica hace I/O sincrona) y reemplaza la conexion
-    /// vieja por una nueva al master vigente. Si la reconexion falla, el
-    /// error sale hacia el `with_retry_cb` de `run`, que reintenta con
-    /// backoff hasta el presupuesto maximo.
+    /// `true` en modo Sentinel: el watchdog de master tiene sentido solo ahi.
+    fn is_sentinel(&self) -> bool {
+        self.client.is_sentinel()
+    }
+
+    /// Watchdog: re-resuelve el master y reconecta aunque ninguna operacion
+    /// haya fallado. Cubre el caso de una conexion viva contra un nodo que
+    /// dejo de ser master (p. ej. un primario pausado) donde el read solo
+    /// vence por timeout local.
+    async fn recheck_master(&self) -> Result<(), Failure> {
+        self.recover().await
+    }
+
+    /// Re-resuelve el master via la fabrica (`reset`, async con timeouts) y
+    /// reemplaza la conexion vieja por una nueva al master vigente. Toda la
+    /// operacion (resolucion + conexion) queda acotada por [`RECOVER_TIMEOUT`]:
+    /// si el master viejo no responde, devuelve un fallo transitorio en vez de
+    /// colgar el loop.
     async fn recover(&self) -> Result<(), Failure> {
-        self.client
-            .reset_async()
+        let recover = async {
+            self.client
+                .reset_async()
+                .await
+                .map_err(|e| classify_redis_error(&e))?;
+            let fresh = Self::connect_once(&self.client, self.read).await?;
+            match self.conn.lock() {
+                Ok(mut guard) => *guard = fresh,
+                Err(poisoned) => *poisoned.into_inner() = fresh,
+            }
+            Ok(())
+        };
+        timeout(RECOVER_TIMEOUT, recover)
             .await
-            .map_err(|e| classify_redis_error(&e))?;
-        let fresh = Self::connect_once(&self.client, self.read).await?;
-        match self.conn.lock() {
-            Ok(mut guard) => *guard = fresh,
-            Err(poisoned) => *poisoned.into_inner() = fresh,
-        }
-        Ok(())
+            .map_err(|_| Failure::transient(IO_CODE, "recover timeout"))?
     }
 
     /// Corre `op` con Retry+CB sobre la conexion actual. Si `op` falla con
@@ -265,8 +291,11 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // T-08: UN solo cliente re-resoluble compartido por todas las
         // conexiones; ante failover cada MasterConn llama a `reset` y
         // reconecta contra el master vigente.
-        let client =
-            Arc::new(RedisClient::new(&ctx.cfg).map_err(|e| RunnerError::Config(e.to_string()))?);
+        let client = Arc::new(
+            RedisClient::new_async(&ctx.cfg)
+                .await
+                .map_err(|e| RunnerError::Config(e.to_string()))?,
+        );
         // Apagado responsivo: el retry de conexion puede durar hasta 30s;
         // el token lo corta sin esperar al presupuesto de apagado.
         let shared = tokio::select! {
@@ -397,7 +426,25 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // count) en vez de entregarse a jobs que fallarian igual y terminarian
         // quemados por MAX_ATTEMPTS.
         let mut degraded: Option<&'static str> = None;
+        let mut last_master_recheck = Instant::now();
         while !token.is_cancelled() {
+            // Watchdog (T-08): en modo Sentinel, verificar periodicamente que
+            // la conexion siga apuntando al master vigente. Cubre el caso de
+            // un primario pausado donde el read solo vence por timeout local.
+            if rc.is_sentinel() && last_master_recheck.elapsed() >= MASTER_RECHECK_INTERVAL {
+                last_master_recheck = Instant::now();
+                match rc.recheck_master().await {
+                    Ok(()) => debug!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "watchdog: master re-resuelto"
+                    ),
+                    Err(e) => warn!(
+                        service = crate::telemetry::SERVICE,
+                        msg = "watchdog: no se pudo re-resolver el master",
+                        error = %e
+                    ),
+                }
+            }
             if let Some(dep) = degraded_dependency(&ctx.pipeline.breaker(), &ctx.mongo_breaker) {
                 if degraded.is_none() {
                     warn!(
@@ -690,7 +737,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 {
                     Ok(Ok(s)) => Ok(s),
                     Ok(Err(e)) => Err(classify_redis_error(&e)),
-                    Err(_) => Err(Failure::transient(REDIS_TIMEOUT_CODE, "xreadgroup timeout")),
+                    Err(_) => Err(Failure::transient(STALL_CODE, "xreadgroup timeout")),
                 }
             })
             .await?;
