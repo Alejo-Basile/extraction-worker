@@ -75,6 +75,20 @@ Evidencia de la verificación (2026-11-12): build OK, `uid=10001(worker)`,
 healthcheck `healthy`, `/healthz` 200, `/readyz` 200 con el stack sano y `503`
 sin el grupo `extraction-workers`.
 
+### Carga hostil reproducible (S5-P1-01)
+
+`labs/hostile_load_harness.sh` levanta las dependencias de labs, genera 4 PDFs
+de 412 páginas (~26 MB), siembra MinIO/Mongo/Redis, ejecuta el worker con
+`--pids-limit 200 --memory 768m --cpus 1.5` y sondea `/readyz` cada 250 ms desde
+dentro del contenedor. Al final imprime un reporte con PASS/FAIL y deja los
+artefactos en `OUT_DIR`:
+
+```bash
+cd labs
+./hostile_load_harness.sh
+# opcional: OUT_DIR=/tmp/s5-p1-01 KEEP=1 ./hostile_load_harness.sh
+```
+
 ## Escaneo de secretos (gitleaks, S0-P1-04)
 
 - **Local (primera capa):** instalar el hook de pre-commit **una vez** en este clone
