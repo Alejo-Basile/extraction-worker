@@ -14,11 +14,19 @@
 //! Ningun mensaje de error de este modulo incluye `redis_url` ni passwords.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use redis::aio::MultiplexedConnection;
-use redis::{AsyncConnectionConfig, IntoConnectionInfo};
+use redis::{
+    AsyncConnectionConfig, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
+    RedisConnectionInfo, RedisError,
+};
 
 use super::config::{parse_sentinel_addr, ConsumerConfig};
+
+/// Cota por consulta a un Sentinel (conexion + comando). Un Sentinel que
+/// acepta TCP pero no responde no puede colgar la re-resolucion del master.
+const SENTINEL_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Construye el `redis::Client` del worker segun la configuracion.
 ///
@@ -35,7 +43,20 @@ pub fn build_client(cfg: &ConsumerConfig) -> redis::RedisResult<redis::Client> {
     if cfg.redis_sentinel_addrs.is_empty() {
         return redis::Client::open(cfg.redis_url.as_str());
     }
-    build_sentinel_client(cfg)
+    resolve_master_client_sync(cfg)
+}
+
+/// Igual que [`build_client`] pero con re-resolucion async (timeouts) cuando
+/// la config apunta a Sentinel. Es el camino del runtime: nunca bloquea el
+/// reactor en I/O de Sentinels ni se cuelga contra un master pausado.
+pub async fn build_client_async(cfg: &ConsumerConfig) -> redis::RedisResult<redis::Client> {
+    cfg.validate().map_err(|e| {
+        redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "config invalida", e))
+    })?;
+    if cfg.redis_sentinel_addrs.is_empty() {
+        return redis::Client::open(cfg.redis_url.as_str());
+    }
+    resolve_master_client_async(cfg).await
 }
 
 /// `true` si el error del servidor es `READONLY` (escritura contra un
@@ -79,6 +100,15 @@ impl RedisClient {
         })
     }
 
+    /// Constructor async: en modo Sentinel resuelve el master con timeouts y
+    /// sin conectar al candidato. Usarlo en el runtime (runner y readyz).
+    pub async fn new_async(cfg: &ConsumerConfig) -> redis::RedisResult<Self> {
+        Ok(Self {
+            cfg: cfg.clone(),
+            client: RwLock::new(build_client_async(cfg).await?),
+        })
+    }
+
     /// `true` cuando la config apunta a Sentinel (re-resolucion activa).
     pub fn is_sentinel(&self) -> bool {
         !self.cfg.redis_sentinel_addrs.is_empty()
@@ -98,15 +128,17 @@ impl RedisClient {
         Ok(())
     }
 
-    /// `reset()` en un hilo bloqueante: en modo Sentinel la fabrica hace
-    /// I/O sincrona contra los sentinels y no debe correr en el runtime.
+    /// `reset()` async: re-resuelve el master con timeouts y sin
+    /// `spawn_blocking`. Un Sentinel que no responde devuelve error en
+    /// `SENTINEL_QUERY_TIMEOUT`, no cuelga el reactor.
     pub async fn reset_async(self: &Arc<Self>) -> redis::RedisResult<()> {
-        let client = Arc::clone(self);
-        tokio::task::spawn_blocking(move || client.reset())
-            .await
-            .map_err(|e| {
-                redis::RedisError::from((redis::ErrorKind::Io, "reset join", e.to_string()))
-            })?
+        let fresh = build_client_async(&self.cfg).await?;
+        let mut guard = match self.client.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = fresh;
+        Ok(())
     }
 
     /// Conexion multiplexada al master actual (el `Client` vivo tras el
@@ -133,49 +165,163 @@ impl RedisClient {
     }
 }
 
-fn build_sentinel_client(cfg: &ConsumerConfig) -> redis::RedisResult<redis::Client> {
-    use redis::sentinel::{SentinelClientBuilder, SentinelServerType};
+/// Nombre del master configurado (`REDIS_MASTER_NAME`).
+fn master_name(cfg: &ConsumerConfig) -> redis::RedisResult<&str> {
+    cfg.redis_master_name.as_deref().ok_or_else(|| {
+        RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "config invalida",
+            "REDIS_MASTER_NAME ausente".to_string(),
+        ))
+    })
+}
 
-    // `validate()` ya garantiza que las addrs parsean y que el master name
-    // existe; se re-parsean aqui para armar `ConnectionAddr` sin unwrap.
-    let mut addrs = Vec::with_capacity(cfg.redis_sentinel_addrs.len());
-    for raw in &cfg.redis_sentinel_addrs {
-        let (host, port) = parse_sentinel_addr(raw).map_err(|e| {
-            redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "addr invalida", e))
-        })?;
-        addrs.push(redis::ConnectionAddr::Tcp(host, port));
-    }
-    let master_name = match &cfg.redis_master_name {
-        Some(name) => name.as_str(),
-        None => {
-            return Err(redis::RedisError::from((
-                redis::ErrorKind::InvalidClientConfig,
-                "config invalida",
-                "REDIS_MASTER_NAME ausente".to_string(),
-            )))
+/// Addrs de los Sentinels ya parseadas. `validate()` corre antes, pero se
+/// re-parsean para no depender de indices ni unwraps.
+fn sentinel_targets(cfg: &ConsumerConfig) -> redis::RedisResult<Vec<(String, u16)>> {
+    cfg.redis_sentinel_addrs
+        .iter()
+        .map(|raw| {
+            parse_sentinel_addr(raw)
+                .map_err(|e| RedisError::from((ErrorKind::InvalidClientConfig, "addr invalida", e)))
+        })
+        .collect()
+}
+
+/// `ConnectionInfo` de un Sentinel. La auth de Sentinel es opt-in
+/// (`REDIS_SENTINEL_PASSWORD`) y nunca reusa el password del master.
+fn sentinel_connection_info(
+    host: &str,
+    port: u16,
+    cfg: &ConsumerConfig,
+) -> redis::RedisResult<ConnectionInfo> {
+    let base = format!("redis://{host}:{port}").into_connection_info()?;
+    Ok(match sentinel_auth_password(cfg) {
+        Some(password) => {
+            base.set_redis_settings(RedisConnectionInfo::default().set_password(password))
         }
-    };
+        None => base,
+    })
+}
 
-    // La auth del master viaja SOLO embebida en REDIS_URL; se extrae con la
-    // API de redis (nunca con un parser manual). Sin password en la URL, no se
-    // configura auth del master.
-    let url_info = cfg.redis_url.as_str().into_connection_info()?;
-    let master_password = url_info.redis_settings().password().map(str::to_owned);
+/// `ConnectionInfo` del master: conserva password/db/username/protocol de
+/// `REDIS_URL` y solo reemplaza la direccion por la que respondio Sentinel.
+fn master_connection_info(
+    host: &str,
+    port: u16,
+    cfg: &ConsumerConfig,
+) -> redis::RedisResult<ConnectionInfo> {
+    let base = cfg.redis_url.as_str().into_connection_info()?;
+    Ok(base.set_addr(ConnectionAddr::Tcp(host.to_string(), port)))
+}
 
-    let mut builder = SentinelClientBuilder::new(addrs, master_name, SentinelServerType::Master)?;
-    if let Some(password) = master_password.as_deref() {
-        builder = builder.set_client_to_redis_password(password);
+fn client_from_master_reply(
+    reply: &[String],
+    cfg: &ConsumerConfig,
+) -> redis::RedisResult<redis::Client> {
+    if reply.len() != 2 {
+        return Err(RedisError::from((
+            ErrorKind::UnexpectedReturnType,
+            "respuesta de SENTINEL invalida",
+        )));
     }
-    // T-10: la auth hacia los Sentinels es opt-in y NUNCA reusa el password
-    // del master. Este stack corre Sentinels sin `requirepass`: mandarles
-    // `AUTH` los rechaza y redis-rs lo reporta como `AuthenticationFailed`.
-    if let Some(sentinel_password) = sentinel_auth_password(cfg) {
-        builder = builder.set_client_to_sentinel_password(sentinel_password);
+    let port = reply[1].parse::<u16>().map_err(|_| {
+        RedisError::from((
+            ErrorKind::UnexpectedReturnType,
+            "puerto de SENTINEL invalido",
+        ))
+    })?;
+    // NUNCA se conecta al master aca: solo se construye el Client. Conectar
+    // al candidato es lo que colgaba contra un master pausado.
+    redis::Client::open(master_connection_info(&reply[0], port, cfg)?)
+}
+
+/// Resolucion sync (modo CLI/tests): consulta solo a los Sentinels, nunca
+/// abre socket contra el master. Sin timeout por sentinel; el runtime usa
+/// la version async.
+fn resolve_master_client_sync(cfg: &ConsumerConfig) -> redis::RedisResult<redis::Client> {
+    let name = master_name(cfg)?;
+    let mut last_err: Option<RedisError> = None;
+    for (host, port) in sentinel_targets(cfg)? {
+        let attempt = (|| -> redis::RedisResult<redis::Client> {
+            let client = redis::Client::open(sentinel_connection_info(&host, port, cfg)?)?;
+            let mut conn = client.get_connection()?;
+            let reply: Vec<String> = redis::cmd("SENTINEL")
+                .arg("get-master-addr-by-name")
+                .arg(name)
+                .query(&mut conn)?;
+            client_from_master_reply(&reply, cfg)
+        })();
+        match attempt {
+            Ok(client) => return Ok(client),
+            Err(e) => last_err = Some(e),
+        }
     }
-    // `get_client` consulta a los sentinels (I/O) y devuelve un Client
-    // apuntando al master que respondan: no hay IP fija en el codigo.
-    let mut client = builder.build()?;
-    client.get_client()
+    Err(last_err.unwrap_or_else(|| {
+        RedisError::from((
+            ErrorKind::MasterNameNotFoundBySentinel,
+            "ningun sentinel respondio",
+        ))
+    }))
+}
+
+/// Resolucion async con timeout por Sentinel (conexion + comando).
+async fn resolve_master_client_async(cfg: &ConsumerConfig) -> redis::RedisResult<redis::Client> {
+    let name = master_name(cfg)?;
+    let mut last_err: Option<RedisError> = None;
+    for (host, port) in sentinel_targets(cfg)? {
+        match query_sentinel_master_async(&host, port, name, cfg).await {
+            Ok((master_host, master_port)) => {
+                return redis::Client::open(master_connection_info(&master_host, master_port, cfg)?)
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        RedisError::from((
+            ErrorKind::MasterNameNotFoundBySentinel,
+            "ningun sentinel respondio",
+        ))
+    }))
+}
+
+async fn query_sentinel_master_async(
+    host: &str,
+    port: u16,
+    name: &str,
+    cfg: &ConsumerConfig,
+) -> redis::RedisResult<(String, u16)> {
+    let client = redis::Client::open(sentinel_connection_info(host, port, cfg)?)?;
+    let mut conn = tokio::time::timeout(
+        SENTINEL_QUERY_TIMEOUT,
+        client.get_multiplexed_async_connection(),
+    )
+    .await
+    .map_err(|_| RedisError::from((ErrorKind::Io, "timeout conectando al Sentinel")))??;
+
+    let reply: Vec<String> = tokio::time::timeout(
+        SENTINEL_QUERY_TIMEOUT,
+        redis::cmd("SENTINEL")
+            .arg("get-master-addr-by-name")
+            .arg(name)
+            .query_async(&mut conn),
+    )
+    .await
+    .map_err(|_| RedisError::from((ErrorKind::Io, "timeout consultando al Sentinel")))??;
+
+    if reply.len() != 2 {
+        return Err(RedisError::from((
+            ErrorKind::UnexpectedReturnType,
+            "respuesta de SENTINEL invalida",
+        )));
+    }
+    let master_port = reply[1].parse::<u16>().map_err(|_| {
+        RedisError::from((
+            ErrorKind::UnexpectedReturnType,
+            "puerto de SENTINEL invalido",
+        ))
+    })?;
+    Ok((reply[0].clone(), master_port))
 }
 
 /// Password de auth hacia los Sentinels (T-10). Opt-in: solo
@@ -481,6 +627,180 @@ mod tests {
         assert!(
             !err.contains("redis://"),
             "el error no puede contener la URL: {err}"
+        );
+    }
+
+    // --- T-08 (S6-P1-01): resolucion Sentinel sin colgarse en el master ---
+
+    /// Config Sentinel apuntando a los `addrs` dados.
+    fn sentinel_cfg(addrs: Vec<String>) -> ConsumerConfig {
+        let mut cfg = direct_cfg_with_url("redis://127.0.0.1:1/");
+        cfg.redis_sentinel_addrs = addrs;
+        cfg.redis_master_name = Some("myprimary".to_string());
+        cfg
+    }
+
+    /// Servidor que acepta conexiones y **nunca responde** (master pausado).
+    /// Cuenta las aceptaciones para probar quien se conecta.
+    async fn spawn_black_hole() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("bind black hole: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // Mantener el socket abierto sin escribir jamas.
+                    let _keep = stream;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    /// Extrae un comando RESP array completo del buffer: `(args, consumidos)`.
+    fn take_resp_command(buf: &[u8]) -> Option<(Vec<String>, usize)> {
+        if buf.first() != Some(&b'*') {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == b'\n')?;
+        let n: usize = std::str::from_utf8(&buf[1..end])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let mut pos = end + 1;
+        let mut args = Vec::with_capacity(n);
+        for _ in 0..n {
+            if buf.get(pos) != Some(&b'$') {
+                return None;
+            }
+            let e = buf[pos..].iter().position(|&b| b == b'\n')? + pos;
+            let len: usize = std::str::from_utf8(&buf[pos + 1..e])
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            let start = e + 1;
+            let arg_end = start + len;
+            if buf.len() < arg_end + 2 {
+                return None;
+            }
+            args.push(String::from_utf8_lossy(&buf[start..arg_end]).to_string());
+            pos = arg_end + 2;
+        }
+        Some((args, pos))
+    }
+
+    /// Sentinel RESP minimo: responde `+OK` al setup y la addr del master a
+    /// `SENTINEL get-master-addr-by-name`.
+    async fn spawn_sentinel_stub(master_port: u16) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("bind sentinel: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 512];
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some((args, consumed)) = take_resp_command(&buf) {
+                            buf.drain(..consumed);
+                            let is_sentinel = args
+                                .first()
+                                .map(|a| a.eq_ignore_ascii_case("SENTINEL"))
+                                .unwrap_or(false);
+                            let reply = if is_sentinel {
+                                let port = master_port.to_string();
+                                format!("*2\r\n$9\r\n127.0.0.1\r\n${}\r\n{}\r\n", port.len(), port)
+                            } else {
+                                "+OK\r\n".to_string()
+                            };
+                            if stream.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn resolver_async_no_se_conecta_al_master() {
+        let (master, accepts) = spawn_black_hole().await;
+        let sentinel = spawn_sentinel_stub(master.port()).await;
+        let cfg = sentinel_cfg(vec![sentinel.to_string()]);
+
+        let started = std::time::Instant::now();
+        let client =
+            match tokio::time::timeout(Duration::from_secs(3), build_client_async(&cfg)).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(e)) => panic!("resolver async: {e}"),
+                Err(_) => panic!("el resolver no debe colgarse contra el master"),
+            };
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "el resolver debe terminar rapido"
+        );
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "el resolver NO debe abrir socket contra el master"
+        );
+
+        // El client resuelto apunta al master: recien el connect abre el socket.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(700),
+            client.get_multiplexed_async_connection(),
+        )
+        .await;
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "connect posterior debe ir al master resuelto"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_async_corta_con_sentinel_mudo() {
+        let (silent, _) = spawn_black_hole().await;
+        let cfg = sentinel_cfg(vec![silent.to_string()]);
+
+        let started = std::time::Instant::now();
+        let result =
+            match tokio::time::timeout(Duration::from_secs(6), build_client_async(&cfg)).await {
+                Ok(result) => result,
+                Err(_) => panic!("el timeout interno por sentinel debe cortar antes"),
+            };
+        assert!(result.is_err(), "un sentinel mudo no puede resolver");
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "debe cortar por SENTINEL_QUERY_TIMEOUT, no colgarse"
         );
     }
 }
