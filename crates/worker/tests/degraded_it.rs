@@ -612,16 +612,31 @@ async fn caida_de_minio_no_quema_mensajes_y_recupera_sin_dlq() {
 
     // El "stuck" quedo pendiente con delivery 1. Sin el gate, el autoclaim
     // (cada segundo) lo reclamaria en bucle hasta la 4ta entrega: DLQ.
-    let expected = vec![(stuck_msg.clone(), 1usize)];
+    // Al abrirse el breaker puede quedar un read en vuelo que ya tomo un K:
+    // ese mensaje tambien queda en la PEL con delivery 1 y se procesa al
+    // recuperar. Lo que no debe pasar es que la PEL crezca ni que suba el
+    // delivery count.
+    let max_pending = 2; // stuck + a lo sumo un read en vuelo (BATCH_COUNT=1)
     let snap1 = pending_snapshot(&mut conn, &stream, &group).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
     let snap2 = pending_snapshot(&mut conn, &stream, &group).await;
+    for snap in [&snap1, &snap2] {
+        assert!(
+            snap.iter()
+                .any(|(id, delivered)| id == &stuck_msg && *delivered == 1),
+            "el stuck debe estar pendiente con delivery count 1; PEL={snap:?}"
+        );
+        assert!(
+            snap.iter().all(|(_, delivered)| *delivered == 1),
+            "la caida no debe acumular reintentos; PEL={snap:?}"
+        );
+        assert!(
+            snap.len() <= max_pending,
+            "la PEL no debe crecer mas alla del stuck y un read en vuelo; PEL={snap:?}"
+        );
+    }
     assert_eq!(
-        snap1, expected,
-        "la PEL debe tener solo el stuck, con delivery count 1"
-    );
-    assert_eq!(
-        snap2, expected,
+        snap1, snap2,
         "la PEL debe quedar congelada durante la caida (delivery counts estables)"
     );
     assert_eq!(
