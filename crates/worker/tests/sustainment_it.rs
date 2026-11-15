@@ -82,6 +82,10 @@ fn free_port() -> u16 {
     must(listener.local_addr()).port()
 }
 
+fn max_concurrency() -> String {
+    std::env::var("SUSTAINMENT_MAX_CONCURRENCY").unwrap_or_else(|_| "4".to_string())
+}
+
 /// Generador de PDFs con texto (misma tecnica que el corpus de S5-P3-05):
 /// objetos consecutivos y xref clasica, para no versionar binarios.
 fn build_pdf(objects: &[String]) -> Vec<u8> {
@@ -166,7 +170,7 @@ fn spawn_worker(port: u16, stream: &str, group: &str) -> Child {
             )
             .env("WORKER_BLOCK_MS", "200")
             .env("WORKER_BATCH_COUNT", "10")
-            .env("WORKER_MAX_CONCURRENCY", "4")
+            .env("WORKER_MAX_CONCURRENCY", max_concurrency())
             .env("WORKER_MAX_ATTEMPTS", "5")
             .env("WORKER_MIN_IDLE_MS", "10000")
             .env("WORKER_DEAD_CONSUMER_MS", "10000")
@@ -281,6 +285,70 @@ fn gauge_value(metrics: &str, series: &str) -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SummaryStats {
+    count: u64,
+    sum: f64,
+    p95: f64,
+    max: f64,
+}
+
+fn sample_value(metrics: &str, name: &str, label: &str) -> Option<f64> {
+    metrics.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let series = fields.next()?;
+        if !series.starts_with(name) || !series.contains(label) {
+            return None;
+        }
+        fields.next()?.parse().ok()
+    })
+}
+
+/// `metrics::histogram!` se exporta como summary de Prometheus: ademas de
+/// `_count`/`_sum`, expone quantiles. Se usan p95 y el quantile 1 (maximo).
+fn summary_stats(metrics: &str, name: &str, outcome: &str) -> Option<SummaryStats> {
+    let label = format!("outcome=\"{outcome}\"");
+    let count = sample_value(metrics, &format!("{name}_count"), &label)? as u64;
+    let sum = sample_value(metrics, &format!("{name}_sum"), &label)?;
+    let prefix = format!("{name}{{");
+    let mut p95 = None;
+    let mut max = None;
+    for line in metrics.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(series) = fields.next() else {
+            continue;
+        };
+        if !series.starts_with(&prefix) || !series.contains(&label) {
+            continue;
+        }
+        let Some(q_start) = series.find("quantile=\"") else {
+            continue;
+        };
+        let rest = &series[q_start + 10..];
+        let Some(q_end) = rest.find('"') else {
+            continue;
+        };
+        let Ok(quantile) = rest[..q_end].parse::<f64>() else {
+            continue;
+        };
+        let Some(value) = fields.next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if (quantile - 0.95).abs() < f64::EPSILON {
+            p95 = Some(value);
+        }
+        if (quantile - 1.0).abs() < f64::EPSILON {
+            max = Some(value);
+        }
+    }
+    Some(SummaryStats {
+        count,
+        sum,
+        p95: p95?,
+        max: max?,
+    })
+}
+
 async fn wait_metrics(port: u16, limit: Duration) -> bool {
     let started = Instant::now();
     while started.elapsed() < limit {
@@ -384,6 +452,7 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         let _: () = must(pipe.query_async(&mut conn).await);
     }
 
+    let concurrency = max_concurrency();
     let port = free_port();
     let worker = WorkerGuard(spawn_worker(port, &stream, &group));
     let pid = worker.0.id();
@@ -503,6 +572,21 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+
+    if let Some(m) = try_metrics(port).await {
+        last_metrics = m;
+    }
+    let extraction = summary_stats(&last_metrics, "worker_extraction_seconds", "ok")
+        .unwrap_or_else(|| panic!("falta el summary de extraccion; metricas:\n{last_metrics}"));
+    assert_eq!(
+        extraction.count, DOCS as u64,
+        "el summary debe registrar una extraccion por documento"
+    );
+    let mean_secs = extraction.sum / extraction.count as f64;
+    eprintln!(
+        "calibracion: concurrency={concurrency} extracciones={} media={:.4}s p95={:.4}s max={:.4}s",
+        extraction.count, mean_secs, extraction.p95, extraction.max
+    );
 
     // Apagado limpio.
     // SAFETY: solo se envia una senal al PID del hijo recien creado.

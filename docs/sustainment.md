@@ -49,6 +49,48 @@ La memoria se estabiliza tras el calentamiento y no vuelve a crecer con el
 volumen: no se observó fuga. Los descriptores quedan constantes: no se filtran
 sockets ni archivos temporales (los `TempPdf` se liberan por job).
 
+## Calibración de bulkhead y `min_idle`
+
+La matriz de bulkhead se corrio en el host con el mismo test de 1000 documentos,
+variando `SUSTAINMENT_MAX_CONCURRENCY`:
+
+```bash
+SUSTAINMENT_MAX_CONCURRENCY=1 cargo test --all-features --test sustainment_it -- --ignored --nocapture
+# repetir con 2, 4 y 8
+```
+
+| `MAX_CONCURRENCY` | Docs/s | Pared | CPU | Delta RSS | Delta FDs | p95 extracción | Máximo |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 16.0 | 62.6 s | 71.0 s | 2.0 MiB | 0 | 73.5 ms | 260.5 ms |
+| 2 | 27.9 | 35.8 s | 72.5 s | 3.1 MiB | 0 | 84.2 ms | 349.7 ms |
+| 4 | **44.8** | **22.3 s** | 72.4 s | 3.3 MiB | 0 | 102.6 ms | 136.9 ms |
+| 8 | 57.5 | 17.4 s | 70.9 s | 4.2 MiB | +3 | 160.9 ms | 588.7 ms |
+
+Una corrida de confirmación posterior con 4 dio 34.8 s de pared y p95 de
+150.7 ms (máximo 513.8 ms); la variación del host no cambia la decisión.
+
+**Decisión:** se mantiene `WORKER_MAX_CONCURRENCY=4`. Con 4 se duplica el
+throughput respecto de 2 y se satura la CPU disponible; 8 solo mejora ~28% el
+pared en el host, pero empeora p95 ~57% y lleva el delta de descriptores al
+limite (±3). Bajo el limite de despliegue el beneficio marginal de 8 es menor.
+La matriz se corrio en host; el valor elegido se valido ademas en el arnes
+contenedorizado con `cpus=1.5`, `mem=768m` y `pids=200`:
+
+| Validación Docker (4 PDFs / 412 páginas, `MAX_CONCURRENCY=4`) | Medido |
+|---|---:|
+| Documentos completados | 4/4 |
+| `/readyz` 200 | 20/20 |
+| `/readyz` p95 / máximo | 72.5 ms / 72.5 ms |
+| `worker_pids_current` | 15 / 200 |
+| `memory.peak` | 326,467,584 B (~311 MiB) |
+
+**`WORKER_MIN_IDLE_MS`:** la fórmula vigente es
+`WORKER_JOB_TIMEOUT_SECS * 2000 + 1000`; con 300 s da **601000 ms**. La
+medición de extracción (p95 0.10–0.15 s, máximo <0.6 s) queda muy por debajo del
+timeout duro de 300 s, por lo que el margen de 2x timeout + 1 s es seguro y se
+mantiene. El arnés hostil usa el mismo valor 601000 y la variable
+`WORKER_XAUTOCLAIM_INTERVAL_SECS` correcta.
+
 ## Reproducir
 
 ```bash
@@ -58,8 +100,10 @@ cargo test --all-features --test sustainment_it -- --ignored --nocapture
 ```
 
 El test imprime una línea `sostenimiento: docs=... rss_base=... ...` con las
-medidas de la corrida. Limpia sus propios streams, documentos y objetos al
-terminar (ids únicos por corrida). Corre también en el job `integration` de CI.
+medidas de la corrida y una línea `calibracion: concurrency=... p95=... max=...`
+con el resumen de `worker_extraction_seconds`. Limpia sus propios streams,
+documentos y objetos al terminar (ids únicos por corrida). Corre también en el
+job `integration` de CI.
 
 ## Notas
 

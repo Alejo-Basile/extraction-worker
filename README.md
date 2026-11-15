@@ -131,11 +131,14 @@ cd labs
   `XACK`-ear; los que no terminan se abortan sin `XACK` y quedan en la PEL
   para que otro worker los reclame con `XAUTOCLAIM`.
 - **Calibración de `XAUTOCLAIM`**: `WORKER_MIN_IDLE_MS` se calcula como
-  `WORKER_JOB_TIMEOUT_SECS * 2000 + 1000` (2x el timeout duro del job más 1s).
+  `WORKER_JOB_TIMEOUT_SECS * 2000 + 1000` (2x el timeout duro del job más 1s);
+  con 300 s queda en **601000 ms**. La medición de sostenimiento dio p95 de
+  extracción entre 0.10 y 0.15 s y máximo <0.6 s, muy por debajo del margen.
   Los logs `documento reclamado` / `documento no reclamable` incluyen
   `msg_id`, `consumer` y `attempts`, y las extracciones registran
   `duration_ms`, para verificar que un job vivo no le roba el mensaje a otra
-  instancia.
+  instancia. La matriz de bulkhead está en
+  [`docs/sustainment.md`](docs/sustainment.md#calibración-de-bulkhead-y-min_idle).
 - La composición `Retry → Circuit Breaker → Timeout` por dependencia, sus
   umbrales y la taxonomía de fallos están en
   [`docs/adr/ADR-0007-composicion-resiliencia.md`](docs/adr/ADR-0007-composicion-resiliencia.md).

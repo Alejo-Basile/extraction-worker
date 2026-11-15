@@ -1,12 +1,19 @@
 //! S6-P3-03: modo degradado consciente ante la caida de MinIO.
+//! P3-GAP-01: doble entrega bajo `XAUTOCLAIM` agresivo.
 //!
-//! El criterio de la tarea: durante una caida de MinIO, ningun mensaje debe
+//! El criterio de S6-P3-03: durante una caida de MinIO, ningun mensaje debe
 //! ir a la DLQ (no se queman delivery counts) y los mensajes nuevos quedan en
 //! el stream; al volver MinIO, todo se procesa y completa.
 //!
+//! El criterio de P3-GAP-01: si el mensaje se reclama mientras su primer job
+//! sigue vivo, la segunda entrega se ACK-ea como duplicada y no produce otro
+//! `.txt` ni otra transicion terminal.
+//!
 //! La caida se simula con un proxy TCP toggleable entre el worker y MinIO:
 //! vivo reenvia bytes, muerto corta las conexiones (el cliente ve el cierre
-//! como fallo transitorio de S3). Requiere el stack de labs:
+//! como fallo transitorio de S3). El proxy tambien puede agregar latencia para
+//! forzar el solapamiento del primer job con `XAUTOCLAIM`.
+//! Requiere el stack de labs:
 //! `cd labs && cp .env.example .env && docker compose up -d`
 //! `cargo test --all-features -- --ignored`
 
@@ -16,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use mongodb::bson::{doc, Document as BsonDocument};
 use mongodb::options::ClientOptions;
 use mongodb::Client;
@@ -98,6 +106,10 @@ struct ToggleProxy {
 
 impl ToggleProxy {
     async fn start(upstream: SocketAddr) -> Self {
+        Self::start_with_delay(upstream, Duration::ZERO).await
+    }
+
+    async fn start_with_delay(upstream: SocketAddr, delay: Duration) -> Self {
         let listener = must(TcpListener::bind("127.0.0.1:0").await);
         let addr = must(listener.local_addr());
         let healthy = Arc::new(AtomicBool::new(true));
@@ -117,6 +129,11 @@ impl ToggleProxy {
                 }
                 let cs = cs.clone();
                 must(cs.lock()).spawn(async move {
+                    // La latencia artificial mantiene vivo el primer job
+                    // mientras el autoclaim reclama el mismo mensaje.
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let up = match TcpStream::connect(upstream).await {
                         Ok(u) => u,
                         Err(_) => return, // cuelga el lado del cliente
@@ -168,58 +185,91 @@ impl Drop for WorkerGuard {
     }
 }
 
+async fn stop_worker(worker: &mut WorkerGuard) {
+    // SAFETY: solo se envia una senal al PID del hijo recien creado.
+    let rc = unsafe { libc::kill(worker.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM) fallo");
+    let started = Instant::now();
+    loop {
+        match worker.0.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "el worker salio con error: {status:?}");
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("try_wait fallo: {e}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "el worker no termino tras SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn spawn_worker(port: u16, s3_endpoint: &str, stream: &str, group: &str) -> Child {
-    must(
-        Command::new(env!("CARGO_BIN_EXE_extraction-worker"))
-            .env("HTTP_PORT", port.to_string())
-            .env("RUST_LOG", "off")
-            .env("LOG_FORMAT", "text")
-            // El job `integration` de CI exporta vars de Sentinel para
-            // sentinel_it; el worker de este IT debe quedarse en modo directo
-            // (REDIS_URL), asi que se las quitamos al hijo.
-            .env_remove("REDIS_SENTINEL_ADDRS")
-            .env_remove("REDIS_MASTER_NAME")
-            .env_remove("REDIS_SENTINEL_PASSWORD")
-            .env("REDIS_URL", test_url())
-            .env("REDIS_STREAM", stream)
-            .env("REDIS_GROUP", group)
-            .env("REDIS_DLQ_STREAM", format!("{stream}-dlq"))
-            .env(
-                "REDIS_DLQ_REPLAY_AUDIT_STREAM",
-                format!("{stream}-dlq-replay"),
-            )
-            .env("REDIS_DLQ_REPLAYED_KEY", format!("{stream}-dlq-replayed"))
-            .env(
-                "WORKER_CONSUMER_NAME",
-                format!("it-deg-{}", std::process::id()),
-            )
-            .env("WORKER_BLOCK_MS", "200")
-            .env("WORKER_BATCH_COUNT", "1")
-            .env("WORKER_MAX_CONCURRENCY", "2")
-            // Ajustado para que la caida sea demoledora si el gate fallara:
-            // a la tercera entrega el mensaje quemaria en la DLQ.
-            // Con 3 intentos, una unica deferral por CircuitOpen en half-open
-            // no quema el mensaje; sin el gate, el autoclaim durante la caida
-            // lo llevaria a la 4ta entrega y a la DLQ.
-            .env("WORKER_MAX_ATTEMPTS", "3")
-            // Debe superar el tiempo que tarda el breaker en abrir (~5s): si
-            // el autoclaim pudiera reclamar el mensaje mientras su job
-            // original todavia reintenta, lo ACK-earia como duplicado y el
-            // documento quedaria varado en RETRYING.
-            .env("WORKER_MIN_IDLE_MS", "15000")
-            .env("WORKER_DEAD_CONSUMER_MS", "15000")
-            .env("WORKER_XAUTOCLAIM_INTERVAL_SECS", "1")
-            .env("WORKER_METRICS_INTERVAL_SECS", "1")
-            .env("WORKER_JOB_TIMEOUT_SECS", "30")
-            .env("S3_ENDPOINT", s3_endpoint)
-            .env("S3_OP_TIMEOUT_MS", "1000")
-            .env("S3_ACCESS_KEY", s3_access_key())
-            .env("S3_SECRET_KEY", s3_secret_key())
-            .env("MONGO_WORKER_URI", mongo_worker_uri())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn(),
-    )
+    spawn_worker_with(port, s3_endpoint, stream, group, &[])
+}
+
+fn spawn_worker_with(
+    port: u16,
+    s3_endpoint: &str,
+    stream: &str,
+    group: &str,
+    extra_env: &[(&str, &str)],
+) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_extraction-worker"));
+    cmd.env("HTTP_PORT", port.to_string())
+        .env("RUST_LOG", "off")
+        .env("LOG_FORMAT", "text")
+        // El job `integration` de CI exporta vars de Sentinel para
+        // sentinel_it; el worker de este IT debe quedarse en modo directo
+        // (REDIS_URL), asi que se las quitamos al hijo.
+        .env_remove("REDIS_SENTINEL_ADDRS")
+        .env_remove("REDIS_MASTER_NAME")
+        .env_remove("REDIS_SENTINEL_PASSWORD")
+        .env("REDIS_URL", test_url())
+        .env("REDIS_STREAM", stream)
+        .env("REDIS_GROUP", group)
+        .env("REDIS_DLQ_STREAM", format!("{stream}-dlq"))
+        .env(
+            "REDIS_DLQ_REPLAY_AUDIT_STREAM",
+            format!("{stream}-dlq-replay"),
+        )
+        .env("REDIS_DLQ_REPLAYED_KEY", format!("{stream}-dlq-replayed"))
+        .env(
+            "WORKER_CONSUMER_NAME",
+            format!("it-deg-{}", std::process::id()),
+        )
+        .env("WORKER_BLOCK_MS", "200")
+        .env("WORKER_BATCH_COUNT", "1")
+        .env("WORKER_MAX_CONCURRENCY", "2")
+        // Ajustado para que la caida sea demoledora si el gate fallara:
+        // a la tercera entrega el mensaje quemaria en la DLQ.
+        // Con 3 intentos, una unica deferral por CircuitOpen en half-open
+        // no quema el mensaje; sin el gate, el autoclaim durante la caida
+        // lo llevaria a la 4ta entrega y a la DLQ.
+        .env("WORKER_MAX_ATTEMPTS", "3")
+        // Debe superar el tiempo que tarda el breaker en abrir (~5s): si
+        // el autoclaim pudiera reclamar el mensaje mientras su job
+        // original todavia reintenta, lo ACK-earia como duplicado y el
+        // documento quedaria varado en RETRYING.
+        .env("WORKER_MIN_IDLE_MS", "15000")
+        .env("WORKER_DEAD_CONSUMER_MS", "15000")
+        .env("WORKER_XAUTOCLAIM_INTERVAL_SECS", "1")
+        .env("WORKER_METRICS_INTERVAL_SECS", "1")
+        .env("WORKER_JOB_TIMEOUT_SECS", "30")
+        .env("S3_ENDPOINT", s3_endpoint)
+        .env("S3_OP_TIMEOUT_MS", "1000")
+        .env("S3_ACCESS_KEY", s3_access_key())
+        .env("S3_SECRET_KEY", s3_secret_key())
+        .env("MONGO_WORKER_URI", mongo_worker_uri())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    must(cmd.spawn())
 }
 
 async fn get_conn() -> MultiplexedConnection {
@@ -304,6 +354,24 @@ async fn count_status(root: &Client, ids: &[String], status: &str) -> u64 {
     )
 }
 
+async fn status_history(root: &Client, id: &str) -> Vec<String> {
+    let documents = root.database("app").collection::<BsonDocument>("documents");
+    let found = must(documents.find_one(doc! {"_id": id}).await)
+        .unwrap_or_else(|| panic!("documento {id} inexistente"));
+    found
+        .get_array("status_history")
+        .unwrap_or_else(|e| panic!("status_history invalido: {e}"))
+        .iter()
+        .map(|entry| {
+            entry
+                .as_document()
+                .and_then(|d| d.get_str("status").ok())
+                .unwrap_or("sin-status")
+                .to_string()
+        })
+        .collect()
+}
+
 /// GET /metrics sobre HTTP/1.0 (el server cierra la conexion al responder).
 /// `None` mientras el server no acepta conexiones (arranque/apagado).
 async fn try_metrics(port: u16) -> Option<String> {
@@ -325,12 +393,16 @@ async fn get_metrics(port: u16) -> String {
 
 /// Valor de una serie Prometheus exacta (`worker_degraded` o
 /// `worker_breaker_open{dependency="minio"}`).
-fn gauge_value(metrics: &str, series: &str) -> Option<f64> {
+fn metric_value(metrics: &str, series: &str) -> Option<f64> {
     metrics
         .lines()
         .find(|l| l.starts_with(series))
         .and_then(|l| l.split_whitespace().last())
         .and_then(|v| v.parse().ok())
+}
+
+fn gauge_value(metrics: &str, series: &str) -> Option<f64> {
+    metric_value(metrics, series)
 }
 
 /// PEL del grupo: pares (msg_id, delivery_count) para assert de estabilidad.
@@ -366,6 +438,20 @@ async fn wait_gauge(port: u16, series: &str, want: f64, limit: Duration) -> bool
         if try_metrics(port)
             .await
             .is_some_and(|m| gauge_value(&m, series) == Some(want))
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn wait_metric_at_least(port: u16, series: &str, min: f64, limit: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if try_metrics(port)
+            .await
+            .is_some_and(|m| metric_value(&m, series).is_some_and(|v| v >= min))
         {
             return true;
         }
@@ -431,6 +517,22 @@ async fn txt_store() -> Arc<dyn object_store::ObjectStore> {
         .with_allow_http(true)
         .build();
     Arc::new(must(store))
+}
+
+async fn txt_keys(id: &str) -> Vec<String> {
+    let store = txt_store().await;
+    // `list(Some(prefix))` agrega "/" al prefijo; como los .txt no tienen
+    // directorios, se lista el bucket y se filtra por el id.
+    let mut entries = store.list(None);
+    let mut keys = Vec::new();
+    while let Some(entry) = entries.next().await {
+        let key = must(entry).location.to_string();
+        if key.starts_with(id) {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    keys
 }
 
 #[tokio::test]
@@ -557,25 +659,7 @@ async fn caida_de_minio_no_quema_mensajes_y_recupera_sin_dlq() {
     );
 
     // Apagado limpio del worker y limpieza del laboratorio.
-    // SAFETY: solo se envia una senal al PID del hijo recien creado.
-    let rc = unsafe { libc::kill(worker.0.id() as libc::pid_t, libc::SIGTERM) };
-    assert_eq!(rc, 0, "kill(SIGTERM) fallo");
-    let started = Instant::now();
-    loop {
-        match worker.0.try_wait() {
-            Ok(Some(status)) => {
-                assert!(status.success(), "el worker salio con error: {status:?}");
-                break;
-            }
-            Ok(None) => {}
-            Err(e) => panic!("try_wait fallo: {e}"),
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "el worker no termino tras SIGTERM"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    stop_worker(&mut worker).await;
 
     let audit_stream = format!("{stream}-dlq-replay");
     cleanup(
@@ -585,4 +669,98 @@ async fn caida_de_minio_no_quema_mensajes_y_recupera_sin_dlq() {
         &all_ids,
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn autoclaim_agresivo_no_duplica_trabajo() {
+    let tag = format!("it-dup-{}-{}", std::process::id(), now_millis());
+    let stream = format!("it:worker:dup:{tag}");
+    let group = format!("grp-{tag}");
+    let dlq_stream = format!("{stream}-dlq");
+    let audit_stream = format!("{stream}-dlq-replay");
+    let id = format!("{tag}-doc");
+
+    let root = root_client().await;
+    let raw = raw_store().await;
+    must(
+        ObjectStoreExt::put(
+            raw.as_ref(),
+            &StorePath::from(format!("raw-pdfs/{id}.pdf")),
+            fixture_bytes().into(),
+        )
+        .await,
+    );
+    seed_doc(&root, &id).await;
+
+    let mut conn = get_conn().await;
+    create_group(&mut conn, &stream, &group).await;
+    xadd(&mut conn, &stream, &id).await;
+
+    // La latencia artificial mantiene el primer job en vuelo mientras el
+    // autoclaim (cada 1s) reclama el mismo mensaje.
+    let proxy = ToggleProxy::start_with_delay(minio_addr(), Duration::from_secs(3)).await;
+    let port = free_port();
+    let mut worker = WorkerGuard(spawn_worker_with(
+        port,
+        &proxy.endpoint(),
+        &stream,
+        &group,
+        &[
+            ("WORKER_MIN_IDLE_MS", "0"),
+            ("WORKER_XAUTOCLAIM_INTERVAL_SECS", "1"),
+            ("WORKER_DEAD_CONSUMER_MS", "10000"),
+            ("WORKER_MAX_ATTEMPTS", "10"),
+            ("WORKER_MAX_CONCURRENCY", "2"),
+            ("S3_OP_TIMEOUT_MS", "10000"),
+        ],
+    ));
+    assert!(
+        wait_metrics(port, Duration::from_secs(10)).await,
+        "el worker no arranco en 10s"
+    );
+
+    let completed =
+        wait_completed(&root, std::slice::from_ref(&id), 1, Duration::from_secs(30)).await;
+    assert_eq!(completed, 1, "el documento debe completarse una sola vez");
+
+    let duplicate = "worker_documents_total{outcome=\"duplicate\"}";
+    assert!(
+        wait_metric_at_least(port, duplicate, 1.0, Duration::from_secs(15)).await,
+        "el autoclaim no produjo una entrega duplicada; metricas:\n{}",
+        get_metrics(port).await
+    );
+    assert!(
+        wait_gauge(port, "worker_pel_pending", 0.0, Duration::from_secs(10)).await,
+        "la PEL debe quedar drenada tras ACK-ear la entrega duplicada"
+    );
+
+    assert_eq!(
+        status_history(&root, &id).await,
+        vec!["PROCESSING".to_string(), "COMPLETED".to_string()],
+        "la entrega duplicada no debe agregar transiciones"
+    );
+    assert_eq!(
+        txt_keys(&id).await,
+        vec![format!("{id}.txt")],
+        "la entrega duplicada no debe dejar otro .txt"
+    );
+
+    let metrics = get_metrics(port).await;
+    assert_eq!(
+        metric_value(&metrics, "worker_claim_total{result=\"claimed\"}"),
+        Some(1.0),
+        "solo el primer job debe reclamar el documento"
+    );
+    assert_eq!(
+        metric_value(&metrics, "worker_documents_total{outcome=\"completed\"}"),
+        Some(1.0),
+        "solo el job original debe completar"
+    );
+
+    let dlq_len: u64 = must(conn.xlen(&dlq_stream).await);
+    assert_eq!(dlq_len, 0, "la reentrega no debe mandar nada a la DLQ");
+
+    stop_worker(&mut worker).await;
+    cleanup(&root, &mut conn, &[stream, dlq_stream, audit_stream], &[id]).await;
 }
