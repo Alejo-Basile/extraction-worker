@@ -129,8 +129,11 @@ trabajo). Un `CircuitOpen` no consume presupuesto de reintento.
   uso de `with_retry_cb` con el breaker de cada dependencia y timeout por
   operación.
 - `crates/worker/src/consumer/pipeline.rs`: timeout duro del job.
-- Pendiente (`S5-P3-02`/`S5-P3-03`): test de breaker abierto sin red y prueba
-  de degradación con MinIO lento.
+- `crates/worker/tests/resilience_it.rs`: `breaker_abierto_no_abre_conexiones_de_red`
+  (`S5-P3-02`), `s3_lento_dispara_timeout_acotado` y
+  `timeouts_concurrentes_no_agotan_hilos` (`S5-P3-03`).
+- `crates/worker/tests/degraded_it.rs`: caída y recuperación de MinIO sin DLQ,
+  y doble entrega bajo `XAUTOCLAIM` agresivo sin reprocesar (`P3-GAP-01`).
 
 ## Referencias
 

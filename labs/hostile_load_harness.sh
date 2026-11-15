@@ -20,6 +20,7 @@
 #   IMAGE_PAGES=12          páginas de imagen por PDF
 #   LOAD_TIMEOUT_SECS=600   tope de espera de extracción
 #   HOST_PORT=              puerto host opcional para /healthz y /metrics
+#   WORKER_MAX_CONCURRENCY=4 paralelismo del worker (bulkhead)
 #
 # Requisitos: docker + compose v2, python3 con PIL, gs, curl, jq, pdfinfo.
 set -euo pipefail
@@ -44,6 +45,7 @@ READY_INTERVAL_SECS="${READY_INTERVAL_SECS:-0.25}"
 LOAD_TIMEOUT_SECS="${LOAD_TIMEOUT_SECS:-600}"
 HOST_PORT="${HOST_PORT:-}"
 MAX_PDF_BYTES="${MAX_PDF_BYTES:-31457280}"
+WORKER_MAX_CONCURRENCY="${WORKER_MAX_CONCURRENCY:-4}"
 KEEP="${KEEP:-0}"
 
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
@@ -303,15 +305,15 @@ docker run -d --name "$WORKER_NAME" --network "$NETWORK" "${PORT_BIND[@]}" \
     -e S3_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
     -e S3_OP_TIMEOUT_MS=60000 \
     -e WORKER_JOB_TIMEOUT_SECS=300 \
-    -e WORKER_MAX_CONCURRENCY=4 \
-    -e WORKER_MIN_IDLE_MS=600001 \
-    -e WORKER_DEAD_CONSUMER_MS=600001 \
+    -e WORKER_MAX_CONCURRENCY="$WORKER_MAX_CONCURRENCY" \
+    -e WORKER_MIN_IDLE_MS=601000 \
+    -e WORKER_DEAD_CONSUMER_MS=601000 \
     -e WORKER_MAX_ATTEMPTS=5 \
     -e WORKER_MAX_PAGES=2000 \
     -e WORKER_MAX_PDF_BYTES="$MAX_PDF_BYTES" \
     -e WORKER_MAX_OUTPUT_BYTES=52428800 \
     -e WORKER_BLOCK_MS=5000 \
-    -e WORKER_XAUTCLAIM_INTERVAL_SECS=30 \
+    -e WORKER_XAUTOCLAIM_INTERVAL_SECS=30 \
     -e WORKER_METRICS_INTERVAL_SECS=1 \
     -e WORKER_SHUTDOWN_DRAIN_SECS=4 \
     -e RUST_LOG=info \
@@ -495,7 +497,7 @@ fi
     echo "- Stream/group: $STREAM / $GROUP"
     echo "- PDFs: $PDF_COUNT x $((TEXT_PAGES + IMAGE_PAGES)) páginas"
     echo "- Tamaños: $SIZES"
-    echo "- Worker: pids_limit=200, mem_limit=768m, cpus=1.5, MAX_CONCURRENCY=4"
+    echo "- Worker: pids_limit=200, mem_limit=768m, cpus=1.5, MAX_CONCURRENCY=$WORKER_MAX_CONCURRENCY"
     echo
     echo "## /readyz durante saturación"
     echo '```json'
