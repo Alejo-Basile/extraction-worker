@@ -134,6 +134,77 @@ fn cyclic_refs_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Recorta el archivo antes del `xref`: el parser no puede confiar en la
+/// tabla de referencias.
+fn truncated_pdf() -> Vec<u8> {
+    let pdf = text_pdf(1);
+    let cut = pdf
+        .windows(4)
+        .position(|w| w == b"xref")
+        .unwrap_or_else(|| panic!("el PDF generado debe tener xref"));
+    pdf[..cut].to_vec()
+}
+
+fn bad_startxref_pdf() -> Vec<u8> {
+    let text = must(String::from_utf8(text_pdf(1)));
+    let (before, rest) = text
+        .split_once("startxref\n")
+        .unwrap_or_else(|| panic!("el PDF generado debe tener startxref"));
+    let eol = rest
+        .find('\n')
+        .unwrap_or_else(|| panic!("startxref debe terminar en newline"));
+    format!("{before}startxref\n999999999{}", &rest[eol..]).into_bytes()
+}
+
+/// `/Count` absurdo con un solo `/Kids`: el conteo no debe dimensionar
+/// asignaciones ni confiar ciegamente en el numero declarado.
+fn huge_page_count_pdf() -> Vec<u8> {
+    let content = "BT /F1 12 Tf 20 772 Td (Pagina 0) Tj ET\n";
+    let objects = vec![
+        "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+        "<</Type/Pages/Count 100000000/Kids[4 0 R]>>".to_string(),
+        "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_string(),
+        "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 5 0 R/Resources<</Font<</F1 3 0 R>>>>>>".to_string(),
+        format!(
+            "<</Length {}>>\nstream\n{}endstream",
+            content.len(),
+            content
+        ),
+    ];
+    build_pdf(&objects)
+}
+
+/// `/Length` declara mucho mas de lo que hay antes de `endstream`.
+fn oversized_stream_length_pdf() -> Vec<u8> {
+    let mut objects = text_pdf_objects(1);
+    let content = "BT /F1 12 Tf 20 772 Td (Pagina 0) Tj ET\n";
+    objects[4] = format!("<</Length 10000000>>\nstream\n{}endstream", content);
+    build_pdf(&objects)
+}
+
+/// Adjunto ejecutable embebido: debe ignorarse, no extraerse ni ejecutarse.
+fn embedded_file_pdf() -> Vec<u8> {
+    let mut objects = text_pdf_objects(1);
+    objects[0] = "<</Type/Catalog/Pages 2 0 R/Names<</EmbeddedFiles 6 0 R>>>>".to_string();
+    objects.push("<</Names[(malware.bin) 7 0 R]>>".to_string());
+    objects.push("<</Type/Filespec/F(malware.bin)/EF<</F 8 0 R>>>>".to_string());
+    let payload = "MZ-PAYLOAD-NO-EJECUTAR";
+    objects.push(format!(
+        "<</Type/EmbeddedFile/Length {}>>\nstream\n{}endstream",
+        payload.len(),
+        payload
+    ));
+    build_pdf(&objects)
+}
+
+/// `/Launch` en `/OpenAction`: una accion peligrosa que el worker no ejecuta.
+fn launch_action_pdf() -> Vec<u8> {
+    let mut objects = text_pdf_objects(1);
+    objects[0] = "<</Type/Catalog/Pages 2 0 R/OpenAction 6 0 R>>".to_string();
+    objects.push("<</S/Launch/F(calc.exe)/Win<</F(cmd.exe)/P(/c calc.exe)>>>>".to_string());
+    build_pdf(&objects)
+}
+
 fn encrypted_pdf(path: &Path) {
     let bytes = text_pdf(1);
     write_bytes(path, &bytes);
@@ -282,6 +353,130 @@ fn pdf_con_referencias_ciclicas_no_cuelga_ni_paniquea() {
             text.is_empty(),
             "si la libreria es tolerante, no debe inventar texto, obtuvo: {text:?}"
         ),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Acepta el resultado seguro de un hostil: error de negocio acotado o texto
+/// extraido, nunca panic, cuelgue ni clasificacion de infraestructura.
+fn assert_hostile_safe(
+    result: Result<String, extraction_core::ExtractorError>,
+    allowed: &[&str],
+) -> Option<String> {
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.kind,
+                extraction_core::ErrorKind::Business,
+                "un PDF hostil no es fallo de infraestructura: {}",
+                e.code
+            );
+            assert!(
+                allowed.contains(&e.code.as_str()),
+                "codigo inesperado: {}",
+                e.code
+            );
+            None
+        }
+        Ok(text) => Some(text),
+    }
+}
+
+#[test]
+fn pdf_truncado_sin_xref_no_cuelga_ni_paniquea() {
+    let path = temp_path("truncado-sin-xref");
+    write_bytes(&path, &truncated_pdf());
+    let ext = PdfExtractor::new(2000);
+    assert_hostile_safe(
+        extract_with_limit(&ext, &path),
+        &[error_code::PDF_CORRUPT, error_code::PDF_NO_TEXT],
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pdf_con_startxref_fuera_de_rango_no_cuelga() {
+    let path = temp_path("startxref-invalido");
+    write_bytes(&path, &bad_startxref_pdf());
+    let ext = PdfExtractor::new(2000);
+    if let Some(text) = assert_hostile_safe(
+        extract_with_limit(&ext, &path),
+        &[error_code::PDF_CORRUPT, error_code::PDF_NO_TEXT],
+    ) {
+        assert!(
+            text.contains("Pagina 0"),
+            "si reconstruye el xref, el texto debe ser el normal: {text:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pdf_con_count_de_paginas_gigante_no_preasigna() {
+    let path = temp_path("count-gigante");
+    write_bytes(&path, &huge_page_count_pdf());
+    let ext = PdfExtractor::new(2000);
+    match extract_with_limit(&ext, &path) {
+        Ok(text) => assert!(
+            text.contains("Pagina 0"),
+            "el unico kid real debe extraerse: {text:?}"
+        ),
+        Err(e) => {
+            assert_eq!(e.kind, extraction_core::ErrorKind::Business);
+            assert!(
+                e.code == error_code::PDF_TOO_MANY_PAGES || e.code == error_code::PDF_CORRUPT,
+                "codigo inesperado: {}",
+                e.code
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pdf_con_stream_declarado_gigante_pero_corto_no_cuelga() {
+    let path = temp_path("stream-length-invalido");
+    write_bytes(&path, &oversized_stream_length_pdf());
+    let ext = PdfExtractor::new(2000);
+    assert_hostile_safe(
+        extract_with_limit(&ext, &path),
+        &[error_code::PDF_CORRUPT, error_code::PDF_NO_TEXT],
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pdf_con_archivo_adjunto_no_extrae_el_payload() {
+    let path = temp_path("adjunto");
+    write_bytes(&path, &embedded_file_pdf());
+    let ext = PdfExtractor::new(2000);
+    match extract_with_limit(&ext, &path) {
+        Ok(text) => {
+            assert!(text.contains("Pagina 0"), "texto inesperado: {text:?}");
+            assert!(
+                !text.contains("MZ-PAYLOAD-NO-EJECUTAR"),
+                "el adjunto no debe aparecer como texto: {text:?}"
+            );
+        }
+        Err(e) => panic!("el adjunto no debe impedir extraer el texto visible: {e}"),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pdf_con_accion_launch_no_se_ejecuta() {
+    let path = temp_path("launch");
+    write_bytes(&path, &launch_action_pdf());
+    let ext = PdfExtractor::new(2000);
+    match extract_with_limit(&ext, &path) {
+        Ok(text) => {
+            assert!(text.contains("Pagina 0"), "texto inesperado: {text:?}");
+            assert!(
+                !text.contains("calc.exe") && !text.contains("cmd.exe"),
+                "la accion /Launch no debe ejecutarse ni filtrarse: {text:?}"
+            );
+        }
+        Err(e) => panic!("una accion /Launch debe ignorarse, fallo: {e}"),
     }
     let _ = std::fs::remove_file(&path);
 }

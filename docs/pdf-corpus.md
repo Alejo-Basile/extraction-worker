@@ -15,6 +15,12 @@ fija la clasificación y el destino.
 | JavaScript embebido | `/OpenAction` con `/S /JavaScript` | se ignora; se extrae el texto normal | `pdf_con_javascript_embebido_no_se_ejecuta_ni_cuelga` |
 | Fuente malformada | fuente con referencia ausente | `PDF_CORRUPT` si falla; no panic ni cuelgue | `pdf_con_fuente_malformada_no_cuelga_ni_paniquea` |
 | Referencias cíclicas | árbol `/Pages` que se apunta a sí mismo | `PDF_NO_TEXT` (negocio → DLQ); no panic ni cuelgue | `pdf_con_referencias_ciclicas_no_cuelga_ni_paniquea` |
+| Truncado sin `xref` | PDF recortado antes de la tabla | `PDF_CORRUPT`/`PDF_NO_TEXT` (negocio → DLQ) o reparación tolerante; no panic ni cuelgue | `pdf_truncado_sin_xref_no_cuelga_ni_paniquea` |
+| `startxref` inválido | offset fuera del archivo | `PDF_CORRUPT`/`PDF_NO_TEXT` o reparación; no cuelgue | `pdf_con_startxref_fuera_de_rango_no_cuelga` |
+| `/Count` gigante | `100000000` páginas declaradas con un solo `/Kids` | no preasigna por el número declarado; extrae el kid real o falla acotado | `pdf_con_count_de_paginas_gigante_no_preasigna` |
+| `/Length` de stream mentiroso | stream declara 10 MB y entrega pocos bytes | `PDF_CORRUPT`/`PDF_NO_TEXT` o tolerancia; no cuelgue | `pdf_con_stream_declarado_gigante_pero_corto_no_cuelga` |
+| Archivo adjunto embebido | `/EmbeddedFiles` con payload ejecutable | se ignora; solo se extrae el texto visible | `pdf_con_archivo_adjunto_no_extrae_el_payload` |
+| Acción `/Launch` | `/OpenAction` con `calc.exe`/`cmd.exe` | se ignora; no se ejecuta ni se filtra | `pdf_con_accion_launch_no_se_ejecuta` |
 | Hostil con trabajo lento | extractor lento en el pipeline | `JOB_TIMEOUT`, transient → mensaje queda pendiente | `job_timeout_devuelve_transitorio` |
 | Liveness con hostil | job en timeout | `/healthz` sigue respondiendo | `healthz_responde_durante_timeout_de_job` |
 
