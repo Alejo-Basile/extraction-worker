@@ -8,7 +8,7 @@
 ## Contexto
 
 El worker depende de tres sistemas externos en cada trabajo: **Redis**
-(streams, PEL, DLQ), **MinIO** (descarga del PDF y subida del `.txt`) y
+(streams, PEL, DLQ), **MinIO** (descarga del PDF y subida del `.md`) y
 **Mongo** (transición de estado `PROCESSING → COMPLETED`).
 
 Cada dependencia falla de forma distinta y a distinta velocidad. Un único
@@ -55,7 +55,7 @@ flowchart TB
         RR[Retry] --> RCB[CB redis] --> RTO["timeout 5 s"] --> ROP[XREADGROUP / XACK /<br/>XPENDING / XAUTOCLAIM]
     end
     subgraph MinIO
-        MR[Retry] --> MCB[CB minio] --> MTO["timeout 60 s"] --> MOP[GET raw-pdfs /<br/>PUT y DELETE extracted-txt]
+        MR[Retry] --> MCB[CB minio] --> MTO["timeout 60 s"] --> MOP[GET raw-pdfs /<br/>PUT y DELETE extracted-txt/*.md]
     end
     subgraph Mongo
         GR[Retry] --> GCB[CB mongo] --> GTO["timeout 3000 ms"] --> GOP[updateOne claim /<br/>updateOne complete / ping]

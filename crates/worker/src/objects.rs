@@ -3,7 +3,7 @@
 //! - `ObjectStoreSource`: descarga `raw-pdfs/<document_id>.pdf` a un archivo
 //!   temporal en streaming, con limite duro de tamano (defensa en profundidad
 //!   sobre el limite de subida de 30 MB).
-//! - `ObjectStoreSink`: sube `extracted-txt/<document_id>.txt` (put idempotente:
+//! - `ObjectStoreSink`: sube `extracted-txt/<document_id>.md` (put idempotente:
 //!   repetir el paso deja un solo objeto).
 //!
 //! El `minio` de labs es path-style y http; en produccion el endpoint sera

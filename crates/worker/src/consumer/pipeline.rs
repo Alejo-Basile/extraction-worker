@@ -2,7 +2,7 @@
 //!
 //! Flujo por mensaje valido: GET `raw-pdfs/<object_key>` a un archivo temporal
 //! en streaming (con limite duro de tamano), extraccion CPU-bound en
-//! `spawn_blocking`, PUT `extracted-txt/<document_id>.txt` (idempotente).
+//! `spawn_blocking`, PUT `extracted-txt/<document_id>.md` (idempotente).
 //!
 //! Composicion de resiliencia por operacion S3: `Retry` envuelve al breaker
 //! de MinIO (instancia propia, S5-P3-01) y cada intento lleva su timeout.
@@ -84,8 +84,9 @@ fn entropy_suffix() -> u64 {
 }
 
 /// Clave del texto extraido en `extracted-txt` (seccion 11.4).
+/// La extension es `.md`; el contenido sigue siendo texto plano.
 pub fn txt_key(document_id: &str) -> String {
-    format!("{document_id}.txt")
+    format!("{document_id}.md")
 }
 
 /// Topes del pipeline agrupados para no crecer la firma de `new`.
@@ -133,7 +134,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         self.breaker.clone()
     }
 
-    /// Procesa el item completo. Devuelve `Ok(())` si el `.txt` quedo subido;
+    /// Procesa el item completo. Devuelve `Ok(())` si el `.md` quedo subido;
     /// `Err(Failure::Document)` para errores del documento (van a DLQ) y
     /// `Err(Failure::Transient|Fatal|CircuitOpen)` para infraestructura.
     pub async fn process(&self, item: &extraction_core::WorkItem) -> Result<(), Failure> {
@@ -257,7 +258,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
     }
 
     /// Compensacion del paso 5 (S2-P3-09): si el cierre en Mongo fallo tras
-    /// reintentos, borrar el `.txt` recien subido para no dejar huerfanos.
+    /// reintentos, borrar el `.md` recien subido para no dejar huerfanos.
     /// El delete es idempotente; reintentarlo es seguro.
     pub async fn compensate(&self, item: &extraction_core::WorkItem) -> Result<(), Failure> {
         info!(
@@ -445,7 +446,7 @@ mod tests {
         let files = files.lock().unwrap_or_else(|e| e.into_inner());
         let text = files
             .get(&txt_key("01J9Z8QK3M7X2V0N4P6R8T1Y0B"))
-            .unwrap_or_else(|| panic!("falta el .txt en el sink"));
+            .unwrap_or_else(|| panic!("falta el .md en el sink"));
         assert_eq!(text, "hola mundo");
     }
 

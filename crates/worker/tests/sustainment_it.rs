@@ -603,7 +603,7 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         let r = raw.clone();
         let t = txt.clone();
         let raw_key = format!("raw-pdfs/{id}.pdf");
-        let txt_key = format!("{id}.txt");
+        let txt_key = format!("{id}.md");
         dels.spawn(async move {
             let _ = ObjectStoreExt::delete(r.as_ref(), &StorePath::from(raw_key)).await;
             let _ = ObjectStoreExt::delete(t.as_ref(), &StorePath::from(txt_key)).await;

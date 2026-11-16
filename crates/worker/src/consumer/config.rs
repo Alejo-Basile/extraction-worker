@@ -30,7 +30,7 @@ pub struct ConsumerConfig {
     pub max_concurrency: usize,
     /// Limite duro del PDF descargado (defensa en profundidad, S2-P3-01).
     pub max_pdf_bytes: u64,
-    /// S3/MinIO (seccion 11.4): GET raw-pdfs y PUT extracted-txt.
+    /// S3/MinIO (seccion 11.4): GET raw-pdfs y PUT extracted-txt (claves `.md`).
     pub s3_endpoint: String,
     pub s3_bucket_raw: String,
     pub s3_bucket_txt: String,

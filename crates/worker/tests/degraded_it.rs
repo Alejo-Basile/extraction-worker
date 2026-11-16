@@ -7,7 +7,7 @@
 //!
 //! El criterio de P3-GAP-01: si el mensaje se reclama mientras su primer job
 //! sigue vivo, la segunda entrega se ACK-ea como duplicada y no produce otro
-//! `.txt` ni otra transicion terminal.
+//! `.md` ni otra transicion terminal.
 //!
 //! La caida se simula con un proxy TCP toggleable entre el worker y MinIO:
 //! vivo reenvia bytes, muerto corta las conexiones (el cliente ve el cierre
@@ -493,7 +493,7 @@ async fn cleanup(
         let _ =
             ObjectStoreExt::delete(raw.as_ref(), &StorePath::from(format!("raw-pdfs/{id}.pdf")))
                 .await;
-        let _ = ObjectStoreExt::delete(txt.as_ref(), &StorePath::from(format!("{id}.txt"))).await;
+        let _ = ObjectStoreExt::delete(txt.as_ref(), &StorePath::from(format!("{id}.md"))).await;
     }
 }
 
@@ -521,7 +521,7 @@ async fn txt_store() -> Arc<dyn object_store::ObjectStore> {
 
 async fn txt_keys(id: &str) -> Vec<String> {
     let store = txt_store().await;
-    // `list(Some(prefix))` agrega "/" al prefijo; como los .txt no tienen
+    // `list(Some(prefix))` agrega "/" al prefijo; como los .md no tienen
     // directorios, se lista el bucket y se filtra por el id.
     let mut entries = store.list(None);
     let mut keys = Vec::new();
@@ -757,8 +757,8 @@ async fn autoclaim_agresivo_no_duplica_trabajo() {
     );
     assert_eq!(
         txt_keys(&id).await,
-        vec![format!("{id}.txt")],
-        "la entrega duplicada no debe dejar otro .txt"
+        vec![format!("{id}.md")],
+        "la entrega duplicada no debe dejar otro .md"
     );
 
     let metrics = get_metrics(port).await;

@@ -17,7 +17,7 @@ Servicios:
 | Servicio | Puerto | Uso en F3a | Uso en F3b |
 |---|---|---|---|
 | `redis` | 6379 | streams del consumer (tests `#[ignore]`) | idem |
-| `minio` | 9000 (API), 9001 (consola) | `raw-pdfs` (GET) y `extracted-txt` (PUT) | idem |
+| `minio` | 9000 (API), 9001 (consola) | `raw-pdfs` (GET) y `extracted-txt` (PUT, claves `.md`) | idem |
 | `mongo` (rs0) | 27017 | preparado, sin uso | transicion condicional `PROCESSING -> COMPLETED` (S2-P3-08) |
 
 `minio-init` y `mongo-init` son one-shot: crean buckets (`raw-pdfs`,

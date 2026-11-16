@@ -88,7 +88,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
     let txt = get_txt_store().await;
     let id = format!("it-f3a-{}-{}", std::process::id(), now_millis());
     let raw_key = format!("raw-pdfs/{id}.pdf");
-    let txt_key = format!("{id}.txt");
+    let txt_key = format!("{id}.md");
 
     // 1. Subir el PDF de prueba a raw-pdfs (como lo haria el cliente via URL
     // prefirmada).
@@ -152,7 +152,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         .await
         .unwrap_or_else(|e| panic!("pipeline debe triunfar: {e}"));
 
-    // 4. El .txt esta en extracted-txt con texto del fixture.
+    // 4. El .md esta en extracted-txt con texto del fixture.
     let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(txt_key.clone())).await);
     let bytes = must(got.bytes().await);
     let first_text = String::from_utf8_lossy(&bytes).to_string();

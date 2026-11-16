@@ -440,10 +440,10 @@ async fn job_timeout_devuelve_transitorio() {
         "el extractor lento debe haber entrado exactamente una vez"
     );
 
-    // Un job en timeout no escribe el .txt: el pipeline falla y no hay ACK.
+    // Un job en timeout no escribe el .md: el pipeline falla y no hay ACK.
     let files = written.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         files.is_empty(),
-        "un job en timeout no debe escribir el .txt: {files:?}"
+        "un job en timeout no debe escribir el .md: {files:?}"
     );
 }
