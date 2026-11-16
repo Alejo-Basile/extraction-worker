@@ -13,14 +13,14 @@ allow = ["MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-
 db-path = "~/.cargo/advisory-db"
 yanked = "warn"
 ignore = [
+    # h2 0.3.27 via actix-http 3.x. DoS de baja severidad aceptado: el listener
+    # solo expone GET/HEAD de health/metrics y no procesa cuerpos. Se retira al
+    # actualizar actix-http a una version que use h2 >= 0.4.16.
     "RUSTSEC-2026-0258",
-    "RUSTSEC-2026-0346",
-    "RUSTSEC-2026-0347",
-    "RUSTSEC-2026-0348",
-    "RUSTSEC-2026-0349",
-    "RUSTSEC-2026-0382",
-    "RUSTSEC-2026-0384",
+    # backoff 0.4: sin mantenimiento, sin vulnerabilidad conocida. Se reemplaza
+    # por backon o un helper interno en el proximo refactor del reconnect.
     "RUSTSEC-2025-0012",
+    # instant 0.1.13: dependencia transitiva de backoff; desaparece al retirarlo.
     "RUSTSEC-2024-0384",
     # ttf-parser via lopdf (pdf-extract): unmaintained, sin vulnerabilidad conocida.
     "RUSTSEC-2026-0192",

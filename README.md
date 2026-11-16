@@ -102,6 +102,19 @@ cd labs
 - **CI (segunda capa):** el job `gitleaks` (`.github/workflows/gitleaks.yml`)
   escanea el diff de cada PR y cada push a `main`.
 
+## Seguridad y dependencias (A2)
+
+El reporte consolidado vive en [`docs/security-worker.md`](docs/security-worker.md):
+hallazgos por severidad, advisories aceptados con justificación, duplicados,
+licencias y plan de mitigación. `scripts/security-audit.sh` ejecuta `cargo audit`
+con la lista canónica de ignores de `deny.toml`, así CI y local no divergen.
+
+```bash
+cargo deny check bans licenses advisories
+./scripts/security-audit.sh
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
 ## Observabilidad
 
 - **`/healthz`**: el proceso está vivo (liveness, sin tocar dependencias).
