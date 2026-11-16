@@ -156,7 +156,7 @@ async fn complete_cierra_condicional_y_es_idempotente() {
     seed(&root, &id, "QUEUED").await;
     assert!(must(store.claim(&id, &id, NOW).await));
 
-    let txt_ref = format!("{id}.txt");
+    let txt_ref = format!("{id}.md");
     let closed = must(store.complete(&id, &txt_ref, &id, NOW).await);
     assert!(closed, "el cierre debe matchear PROCESSING");
 
@@ -207,14 +207,14 @@ async fn rol_del_worker_no_permite_insert() {
 async fn mongo_caido_en_el_cierre_da_error_transitorio() {
     // Simulacion del caos 4 (S4-P4-04): Mongo no responde cuando el worker
     // intenta cerrar. El error debe ser transitorio para dejar el mensaje
-    // pendiente y que la compensacion borre el .txt.
+    // pendiente y que la compensacion borre el .md.
     let store_res = DocumentStore::connect(&dead_config()).await;
     let store = match store_res {
         Ok(s) => s,
         Err(_) => panic!("connect no debe contactar al servidor todavia"),
     };
     match store
-        .complete("it-f3b-caos", "it-f3b-caos.txt", "corr", NOW)
+        .complete("it-f3b-caos", "it-f3b-caos.md", "corr", NOW)
         .await
     {
         Err(Failure::Transient { .. }) => {}
@@ -341,7 +341,7 @@ async fn mark_terminal_repetido_y_no_aplicable_no_alteran() {
     assert!(!again, "el segundo mark_terminal no debe matchear");
 
     // Escritura con estado de origen distinto: no altera el estado terminal.
-    let from_wrong_state = must(store.complete(&id, &format!("{id}.txt"), &id, NOW).await);
+    let from_wrong_state = must(store.complete(&id, &format!("{id}.md"), &id, NOW).await);
     assert!(
         !from_wrong_state,
         "complete desde REJECTED no debe matchear"

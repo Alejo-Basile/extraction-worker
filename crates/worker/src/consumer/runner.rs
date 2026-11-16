@@ -5,7 +5,8 @@
 //! 2. Delivery count de `XPENDING` > `WORKER_MAX_ATTEMPTS` -> DLQ
 //!    `MAX_ATTEMPTS_EXCEEDED` (transient), sin re-extraer.
 //! 3. Pipeline: GET raw-pdfs -> archivo temporal -> extraccion -> PUT
-//!    extracted-txt. Exito -> `XACK`. `Failure::Document` -> DLQ (business).
+//!    de la salida `.md` en `extracted-txt`. Exito -> `XACK`.
+//!    `Failure::Document` -> DLQ (business).
 //!    Transient/Fatal/CircuitOpen -> el mensaje queda pendiente (se reclama
 //!    con `XAUTOCLAIM` y repite).
 //!
@@ -965,20 +966,20 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // Paso 5 (S2-P3-08): cierre condicional PROCESSING -> COMPLETED.
         match Self::complete(&ctx, &item).await {
             Ok(true) | Ok(false) => {
-                // Ok(false): otro actor cerro o movio el documento; el .txt
+                // Ok(false): otro actor cerro o movio el documento; el .md
                 // subido es identico (put idempotente) y el estado ajeno no
                 // se pisa. En ambos casos la entrega se confirma.
                 metrics::counter!("worker_documents_total", "outcome" => "completed").increment(1);
                 Self::ack_and_log(&ctx, &rc, &msg_id, &item).await;
             }
             Err(e) => {
-                // Compensacion (S2-P3-09): borrar el .txt y dejar el documento
+                // Compensacion (S2-P3-09): borrar el .md y dejar el documento
                 // en PROCESSING para el reconciliador. El mensaje queda
                 // pendiente y se reclamara de nuevo.
                 metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
                 warn!(
                     service = crate::telemetry::SERVICE,
-                    msg = "el cierre en Mongo fallo; se compensa el .txt y queda pendiente",
+                    msg = "el cierre en Mongo fallo; se compensa el .md y queda pendiente",
                     correlation_id = %item.correlation_id,
                     document_id = %item.document_id,
                     error = %e
@@ -989,7 +990,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                             .increment(1);
                         info!(
                             service = crate::telemetry::SERVICE,
-                            msg = "txt compensado (0 huerfanos)",
+                            msg = "md compensado (0 huerfanos)",
                             correlation_id = %item.correlation_id,
                             document_id = %item.document_id
                         );

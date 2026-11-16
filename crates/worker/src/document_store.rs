@@ -11,7 +11,7 @@
 //!   detecta y no pisa el estado ajeno.
 //!
 //! Si el cierre falla tras reintentos, la compensacion (S2-P3-09) borra el
-//! `.txt` de MinIO y el documento queda en `PROCESSING` para el reconciliador.
+//! `.md` de MinIO y el documento queda en `PROCESSING` para el reconciliador.
 
 use std::sync::Arc;
 use std::time::Duration;

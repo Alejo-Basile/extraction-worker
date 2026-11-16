@@ -8,7 +8,7 @@ Extraction Worker Service — servicio en **Rust (Tokio + Actix-web)** del proye
 
 - Consume mensajes del stream `stream:pdf-processing` (consumer group `extraction-workers`, `XREADGROUP`/`XAUTOCLAIM`, SPEC §5.4).
 - Descarga el PDF desde MinIO, valida la cabecera `%PDF-` por rango (SPEC §9) y extrae el texto con los límites de parseo de SPEC §3.3 (timeout duro, topes de páginas/salida).
-- Sube el `.txt` a MinIO y escribe el **estado terminal en Mongo** con transición condicional atómica (ADR-0006, SPEC §6.3).
+- Sube el texto extraído como `.md` (contenido plano) a MinIO y escribe el **estado terminal en Mongo** con transición condicional atómica (ADR-0006, SPEC §6.3).
 - Maneja reintentos (contador = `XPENDING` delivery count) y mueve a la DLQ con `XACK` + `XADD` atómico (SPEC §5.4).
 - Expone `/healthz`, `/readyz`, `/metrics` vía Actix-web (solo health y métricas, SPEC §3.3).
 

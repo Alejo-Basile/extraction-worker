@@ -22,9 +22,9 @@ clasificación `Document | Transient | Fatal | CircuitOpen` vive en
 
 ## Destino del documento
 
-| Causa | Transición Mongo | Objeto `.txt` |
+| Causa | Transición Mongo | Objeto `.md` |
 |---|---|---|
-| Éxito | `PROCESSING -> COMPLETED` | queda en `extracted-txt` |
+| Éxito | `PROCESSING -> COMPLETED` | queda en `extracted-txt` como `<document_id>.md` |
 | Error de documento / negocio | `PROCESSING -> REJECTED` | no se sube |
 | Reintentos de infraestructura agotados | `PROCESSING -> RETRYING`, luego `RETRYING -> EXTRACTION_FAILED` | se compensa al ir a DLQ |
 | `mark_terminal` inválido | no aplica | según estado |

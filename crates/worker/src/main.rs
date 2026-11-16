@@ -48,7 +48,7 @@ async fn main() -> std::io::Result<()> {
     }
     let port = http_port().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt)
+    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt/*.md)
     let cfg = ConsumerConfig::from_env();
     let startup = (
         cfg.stream.clone(),
