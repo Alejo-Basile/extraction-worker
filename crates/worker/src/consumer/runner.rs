@@ -32,13 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use extraction_core::error_code::MAX_ATTEMPTS_EXCEEDED;
+use extraction_core::status::DocumentStatus;
 use extraction_core::{ErrorKind, WorkItem};
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -266,6 +267,21 @@ pub struct ConsumerRunner<S: ObjectSource, K: TextSink> {
     sem: Arc<Semaphore>,
 }
 
+/// Conexiones y cliente ya resueltos antes de arrancar los loops.
+struct Bootstrap {
+    client: Arc<RedisClient>,
+    shared: Arc<MasterConn>,
+}
+
+/// Tareas y canal del consumer, agrupados para drenarlos en el apagado.
+struct RunnerTasks {
+    reader: JoinHandle<()>,
+    autoclaim: JoinHandle<()>,
+    metrics: JoinHandle<()>,
+    jobs: JoinSet<()>,
+    rx: mpsc::Receiver<Vec<(String, HashMap<String, String>)>>,
+}
+
 impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     pub fn new(
         cfg: ConsumerConfig,
@@ -286,6 +302,20 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     }
 
     pub async fn run(&self, token: CancellationToken) -> Result<(), RunnerError> {
+        let Some(boot) = self.bootstrap(&token).await? else {
+            return Ok(());
+        };
+        let Some(mut tasks) = self.spawn_tasks(&token, &boot).await? else {
+            return Ok(());
+        };
+        self.consume(&token, &boot.shared, &mut tasks).await;
+        self.shutdown(tasks).await;
+        Ok(())
+    }
+
+    /// Valida config, crea el cliente y deja listo el master + consumer group.
+    /// `None` significa apagado pedido durante el arranque.
+    async fn bootstrap(&self, token: &CancellationToken) -> Result<Option<Bootstrap>, RunnerError> {
         let ctx = &self.ctx;
         // Config invalida falla aca, sin I/O y sin volcar credenciales (T-07).
         ctx.cfg.validate().map_err(RunnerError::Config)?;
@@ -300,13 +330,12 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // Apagado responsivo: el retry de conexion puede durar hasta 30s;
         // el token lo corta sin esperar al presupuesto de apagado.
         let shared = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
+            _ = token.cancelled() => return Ok(None),
             r = MasterConn::establish(client.clone(), &ctx.redis_breaker, false) => r?,
         };
-        let shared = Arc::new(shared);
         let mut conn = shared.get();
         match tokio::select! {
-            _ = token.cancelled() => return Ok(()),
+            _ = token.cancelled() => return Ok(None),
             r = timeout(REDIS_OP_TIMEOUT, group::ensure_group(&mut conn, &ctx.cfg)) => r,
         } {
             Ok(Ok(())) => {}
@@ -314,7 +343,20 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             Err(_) => return Err(RunnerError::Config("ensure_group timeout".to_string())),
         }
         drop(conn);
+        Ok(Some(Bootstrap {
+            client,
+            shared: Arc::new(shared),
+        }))
+    }
 
+    /// Arranca reader, autoclaim, metricas y el canal reader -> consumidor.
+    /// `None` significa apagado pedido mientras se abrian las conexiones.
+    async fn spawn_tasks(
+        &self,
+        token: &CancellationToken,
+        boot: &Bootstrap,
+    ) -> Result<Option<RunnerTasks>, RunnerError> {
+        let ctx = &self.ctx;
         // El read bloqueante (XREADGROUP BLOCK) va por una conexion PROPIA.
         // Sobre una conexion multiplexada compartida, mientras el BLOCK espera,
         // cualquier otra operacion (gauges, XPENDING del delivery count,
@@ -323,19 +365,19 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // breaker y el consumidor deja de leer. Medido: con BLOCK=5000 el
         // breaker abria a los ~15s y el worker moria.
         let reader_conn = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, true) => r?,
+            _ = token.cancelled() => return Ok(None),
+            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, true) => r?,
         };
 
         // JoinSet de extracciones en vuelo; el apagado los drena con un
         // presupuesto acotado.
-        let mut jobs: JoinSet<()> = JoinSet::new();
+        let jobs = JoinSet::new();
 
         // Gauges de cola en una conexion propia (DoD 3): no bloquean el
         // bucle de lectura ni consumen el bulkhead de extracciones.
         let metrics = tokio::spawn(Self::metrics_loop(
             ctx.clone(),
-            shared.clone(),
+            boot.shared.clone(),
             self.sem.clone(),
             token.clone(),
         ));
@@ -346,19 +388,19 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // servidor (multiplexed_connection.rs:537-546): el mensaje ya
         // entregado por Redis queda en la PEL sin job y sin XACK. Medido: 1 de
         // 4 mensajes entregado y ACKeado sin procesar.
-        let (tx, mut rx) = mpsc::channel::<Vec<(String, HashMap<String, String>)>>(READ_QUEUE);
+        let (tx, rx) = mpsc::channel::<Vec<(String, HashMap<String, String>)>>(READ_QUEUE);
         let reader = tokio::spawn(Self::reader_loop(
             ctx.clone(),
             Arc::new(reader_conn),
-            tx.clone(),
+            tx,
             token.clone(),
         ));
 
         // XAUTOCLAIM fuera del camino del read, con su propia conexion y su
         // propio tick: era justamente el otro branch que cancelaba el read.
         let autoclaim_conn = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, false) => r?,
+            _ = token.cancelled() => return Ok(None),
+            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, false) => r?,
         };
         let autoclaim = tokio::spawn(Self::autoclaim_loop(
             ctx.clone(),
@@ -367,6 +409,22 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             token.clone(),
         ));
 
+        Ok(Some(RunnerTasks {
+            reader,
+            autoclaim,
+            metrics,
+            jobs,
+            rx,
+        }))
+    }
+
+    async fn consume(
+        &self,
+        token: &CancellationToken,
+        shared: &Arc<MasterConn>,
+        tasks: &mut RunnerTasks,
+    ) {
+        let RunnerTasks { jobs, rx, .. } = tasks;
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
@@ -374,7 +432,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     match maybe {
                         Some(batch) => {
                             for (id, fields) in batch {
-                                Self::spawn_job(ctx, &self.sem, &shared, &mut jobs, id, fields);
+                                Self::spawn_job(&self.ctx, &self.sem, shared, jobs, id, fields);
                             }
                         }
                         // El reader termino: no va a llegar mas trabajo.
@@ -384,14 +442,24 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 Some(_) = jobs.join_next() => {}
             }
         }
+    }
+
+    async fn shutdown(&self, tasks: RunnerTasks) {
+        let RunnerTasks {
+            reader,
+            autoclaim,
+            metrics,
+            mut jobs,
+            ..
+        } = tasks;
         let _ = reader.await;
         let _ = autoclaim.await;
-        let aborted = drain_jobs(&mut jobs, ctx.cfg.shutdown_drain).await;
+        let aborted = drain_jobs(&mut jobs, self.ctx.cfg.shutdown_drain).await;
         if aborted == 0 {
             info!(
                 service = crate::telemetry::SERVICE,
                 msg = "apagado: jobs en vuelo drenados",
-                budget_secs = ctx.cfg.shutdown_drain.as_secs()
+                budget_secs = self.ctx.cfg.shutdown_drain.as_secs()
             );
         } else {
             metrics::counter!("worker_shutdown_aborted_total").increment(aborted as u64);
@@ -399,11 +467,10 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 service = crate::telemetry::SERVICE,
                 msg = "apagado: jobs abortados; quedan en la PEL para XAUTOCLAIM",
                 aborted,
-                budget_secs = ctx.cfg.shutdown_drain.as_secs()
+                budget_secs = self.ctx.cfg.shutdown_drain.as_secs()
             );
         }
         let _ = metrics.await;
-        Ok(())
     }
 
     /// Refresca gauges de cola y de estado interno cada
@@ -429,23 +496,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let mut degraded: Option<&'static str> = None;
         let mut last_master_recheck = Instant::now();
         while !token.is_cancelled() {
-            // Watchdog (T-08): en modo Sentinel, verificar periodicamente que
-            // la conexion siga apuntando al master vigente. Cubre el caso de
-            // un primario pausado donde el read solo vence por timeout local.
-            if rc.is_sentinel() && last_master_recheck.elapsed() >= MASTER_RECHECK_INTERVAL {
-                last_master_recheck = Instant::now();
-                match rc.recheck_master().await {
-                    Ok(()) => debug!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "watchdog: master re-resuelto"
-                    ),
-                    Err(e) => warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "watchdog: no se pudo re-resolver el master",
-                        error = %e
-                    ),
-                }
-            }
+            Self::recheck_master_if_due(&rc, &mut last_master_recheck).await;
             if let Some(dep) = degraded_dependency(&ctx.pipeline.breaker(), &ctx.mongo_breaker) {
                 if degraded.is_none() {
                     warn!(
@@ -455,9 +506,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     );
                     degraded = Some(dep);
                 }
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = tokio::time::sleep(DEGRADED_PAUSE) => {}
+                if Self::pause(&token, DEGRADED_PAUSE).await {
+                    break;
                 }
                 continue;
             }
@@ -488,12 +538,40 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     // (cancelarlo ahi entrega mensajes sin procesar: defecto
                     // medido en T-04); el token corta la pausa entre
                     // reintentos.
-                    tokio::select! {
-                        _ = token.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    if Self::pause(&token, Duration::from_millis(500)).await {
+                        break;
                     }
                 }
             }
+        }
+    }
+
+    /// Watchdog (T-08): en modo Sentinel, verifica periodicamente que la
+    /// conexion siga apuntando al master vigente.
+    async fn recheck_master_if_due(rc: &MasterConn, last: &mut Instant) {
+        if !rc.is_sentinel() || last.elapsed() < MASTER_RECHECK_INTERVAL {
+            return;
+        }
+        *last = Instant::now();
+        match rc.recheck_master().await {
+            Ok(()) => debug!(
+                service = crate::telemetry::SERVICE,
+                msg = "watchdog: master re-resuelto"
+            ),
+            Err(e) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "watchdog: no se pudo re-resolver el master",
+                error = %e
+            ),
+        }
+    }
+
+    /// Duerme hasta `delay` o hasta el apagado. Devuelve `true` si hay que
+    /// cortar el bucle.
+    async fn pause(token: &CancellationToken, delay: Duration) -> bool {
+        tokio::select! {
+            _ = token.cancelled() => true,
+            _ = tokio::time::sleep(delay) => false,
         }
     }
 
@@ -795,11 +873,27 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         msg_id: String,
         fields: HashMap<String, String>,
     ) {
-        let cfg = &ctx.cfg;
-        let item = match WorkItem::from_stream_fields(&fields) {
+        let Some((item, attempts)) = Self::validate_job(&ctx, &rc, &msg_id, &fields).await else {
+            return;
+        };
+        if !Self::claim_job(&ctx, &rc, &msg_id, &item, attempts).await {
+            return;
+        }
+        Self::process_job(&ctx, &rc, &msg_id, &item).await;
+    }
+
+    /// Decodifica y valida contrato/schema. Una entrada invalida se manda a la
+    /// DLQ con causa de contrato y devuelve `None`.
+    async fn parse_and_validate(
+        ctx: &JobContext<S, K>,
+        rc: &MasterConn,
+        msg_id: &str,
+        fields: &HashMap<String, String>,
+    ) -> Option<WorkItem> {
+        let item = match WorkItem::from_stream_fields(fields) {
             Ok(item) => item,
             Err(issue) => {
-                let item = best_effort_item(&fields);
+                let item = best_effort_item(fields);
                 warn!(
                     service = crate::telemetry::SERVICE,
                     msg = "contrato invalido; va a la DLQ",
@@ -809,8 +903,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                 );
                 metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
                 let (code, kind) = contract_cause(&issue);
-                Self::dlq_and_log(&ctx, &rc, &msg_id, &item, code, &issue.to_string(), kind).await;
-                return;
+                Self::dlq_and_log(ctx, rc, msg_id, &item, code, &issue.to_string(), kind).await;
+                return None;
             }
         };
         if let Err(issue) = item.validate_schema() {
@@ -823,12 +917,25 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             );
             metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
             let (code, kind) = contract_cause(&issue);
-            Self::dlq_and_log(&ctx, &rc, &msg_id, &item, code, &issue.to_string(), kind).await;
-            return;
+            Self::dlq_and_log(ctx, rc, msg_id, &item, code, &issue.to_string(), kind).await;
+            return None;
         }
+        Some(item)
+    }
+
+    /// Valida contrato, schema y delivery count. Los rechazos y diferidos se
+    /// resuelven aca (DLQ/metrica/log) y devuelven `None`.
+    async fn validate_job(
+        ctx: &JobContext<S, K>,
+        rc: &MasterConn,
+        msg_id: &str,
+        fields: &HashMap<String, String>,
+    ) -> Option<(WorkItem, u64)> {
+        let cfg = &ctx.cfg;
+        let item = Self::parse_and_validate(ctx, rc, msg_id, fields).await?;
 
         // S2-P3-07: sin reintentar el trabajo si ya agoto sus intentos.
-        let attempts = match Self::delivery_count(&ctx, &rc, &msg_id).await {
+        let attempts = match Self::delivery_count(ctx, rc, msg_id).await {
             Ok(a) => a,
             Err(e) => {
                 warn!(
@@ -840,10 +947,10 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     error = %e
                 );
                 metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
-                return;
+                return None;
             }
         };
-        if attempts > cfg.max_attempts as u64 {
+        if attempts_exceeded(attempts, cfg.max_attempts) {
             let message = format!(
                 "agoto {} intentos (delivery count {attempts})",
                 cfg.max_attempts
@@ -859,22 +966,32 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             );
             metrics::counter!("worker_documents_total", "outcome" => "failed").increment(1);
             Self::dlq_and_log(
-                &ctx,
-                &rc,
-                &msg_id,
+                ctx,
+                rc,
+                msg_id,
                 &item,
                 MAX_ATTEMPTS_EXCEEDED,
                 &message,
                 ErrorKind::Transient,
             )
             .await;
-            return;
+            return None;
         }
+        Some((item, attempts))
+    }
 
-        // Reclamo en Mongo (S2-P3-08): QUEUED|RETRYING -> PROCESSING con
-        // status_history. Si no matchea, otro actor ya movio el estado: el
-        // mensaje es una entrega duplicada y se ACK-ea sin reprocesar.
-        match Self::claim(&ctx, &item).await {
+    /// Reclamo en Mongo (S2-P3-08): QUEUED|RETRYING -> PROCESSING con
+    /// status_history. Si no matchea, otro actor ya movio el estado: el
+    /// mensaje es una entrega duplicada y se ACK-ea sin reprocesar.
+    async fn claim_job(
+        ctx: &JobContext<S, K>,
+        rc: &MasterConn,
+        msg_id: &str,
+        item: &WorkItem,
+        attempts: u64,
+    ) -> bool {
+        let cfg = &ctx.cfg;
+        match Self::claim(ctx, item).await {
             Ok(true) => {
                 metrics::counter!("worker_claim_total", "result" => "claimed").increment(1);
                 info!(
@@ -887,6 +1004,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     attempts,
                     min_idle_ms = cfg.min_idle_ms
                 );
+                true
             }
             Ok(false) => {
                 metrics::counter!("worker_claim_total", "result" => "not_claimable").increment(1);
@@ -900,8 +1018,8 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     consumer = %cfg.consumer_name,
                     attempts
                 );
-                Self::ack_and_log(&ctx, &rc, &msg_id, &item).await;
-                return;
+                Self::ack_and_log(ctx, rc, msg_id, item).await;
+                false
             }
             Err(e) => {
                 metrics::counter!("worker_claim_total", "result" => "error").increment(1);
@@ -913,100 +1031,108 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     document_id = %item.document_id,
                     error = %e
                 );
-                return;
+                false
             }
         }
+    }
 
-        // S2-P3-01/03: pipeline con bulkhead implicito (esta tarea tiene
-        // permiso). Documento roto -> DLQ; infra -> pendiente.
-        if let Err(f) = ctx.pipeline.process(&item).await {
-            match f {
-                Failure::Document { code, message } => {
-                    metrics::counter!("worker_documents_total", "outcome" => "rejected")
-                        .increment(1);
-                    Self::dlq_and_log(
-                        &ctx,
-                        &rc,
-                        &msg_id,
-                        &item,
-                        &code,
-                        &message,
-                        ErrorKind::Business,
-                    )
-                    .await;
-                }
-                Failure::Transient { code, message } | Failure::Fatal { code, message } => {
-                    metrics::counter!("worker_documents_total", "outcome" => "deferred")
-                        .increment(1);
-                    warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "fallo de infraestructura; el mensaje queda pendiente",
-                        correlation_id = %item.correlation_id,
-                        document_id = %item.document_id,
-                        code = %code,
-                        error = %message
-                    );
-                    Self::mark_retrying(&ctx, &item).await;
-                }
-                Failure::CircuitOpen => {
-                    metrics::counter!("worker_documents_total", "outcome" => "deferred")
-                        .increment(1);
-                    warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "circuito de MinIO abierto; el mensaje queda pendiente",
-                        correlation_id = %item.correlation_id,
-                        document_id = %item.document_id
-                    );
-                    Self::mark_retrying(&ctx, &item).await;
-                }
-            }
+    /// Ejecuta el pipeline y resuelve exito o fallo con las mismas
+    /// transiciones/ACK/compensacion de F3.
+    async fn process_job(ctx: &JobContext<S, K>, rc: &MasterConn, msg_id: &str, item: &WorkItem) {
+        if let Err(failure) = ctx.pipeline.process(item).await {
+            Self::handle_pipeline_failure(ctx, rc, msg_id, item, failure).await;
             return;
         }
+        Self::finish_job(ctx, rc, msg_id, item).await;
+    }
 
-        // Paso 5 (S2-P3-08): cierre condicional PROCESSING -> COMPLETED.
-        match Self::complete(&ctx, &item).await {
+    async fn handle_pipeline_failure(
+        ctx: &JobContext<S, K>,
+        rc: &MasterConn,
+        msg_id: &str,
+        item: &WorkItem,
+        failure: Failure,
+    ) {
+        match failure {
+            Failure::Document { code, message } => {
+                metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
+                Self::dlq_and_log(ctx, rc, msg_id, item, &code, &message, ErrorKind::Business)
+                    .await;
+            }
+            Failure::Transient { code, message } | Failure::Fatal { code, message } => {
+                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "fallo de infraestructura; el mensaje queda pendiente",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id,
+                    code = %code,
+                    error = %message
+                );
+                Self::mark_retrying(ctx, item).await;
+            }
+            Failure::CircuitOpen => {
+                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+                warn!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "circuito de MinIO abierto; el mensaje queda pendiente",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id
+                );
+                Self::mark_retrying(ctx, item).await;
+            }
+        }
+    }
+
+    /// Paso 5 (S2-P3-08): cierre condicional PROCESSING -> COMPLETED. Si el
+    /// cierre falla, compensa el `.md` y deja el mensaje pendiente.
+    async fn finish_job(ctx: &JobContext<S, K>, rc: &MasterConn, msg_id: &str, item: &WorkItem) {
+        match Self::complete(ctx, item).await {
             Ok(true) | Ok(false) => {
                 // Ok(false): otro actor cerro o movio el documento; el .md
                 // subido es identico (put idempotente) y el estado ajeno no
                 // se pisa. En ambos casos la entrega se confirma.
                 metrics::counter!("worker_documents_total", "outcome" => "completed").increment(1);
-                Self::ack_and_log(&ctx, &rc, &msg_id, &item).await;
+                Self::ack_and_log(ctx, rc, msg_id, item).await;
             }
-            Err(e) => {
-                // Compensacion (S2-P3-09): borrar el .md y dejar el documento
-                // en PROCESSING para el reconciliador. El mensaje queda
-                // pendiente y se reclamara de nuevo.
-                metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+            Err(e) => Self::compensate_after_complete_error(ctx, item, &e).await,
+        }
+    }
+
+    /// Compensacion (S2-P3-09): borrar el `.md` y dejar el documento en
+    /// PROCESSING para el reconciliador. El mensaje queda pendiente.
+    async fn compensate_after_complete_error(
+        ctx: &JobContext<S, K>,
+        item: &WorkItem,
+        error: &Failure,
+    ) {
+        metrics::counter!("worker_documents_total", "outcome" => "deferred").increment(1);
+        warn!(
+            service = crate::telemetry::SERVICE,
+            msg = "el cierre en Mongo fallo; se compensa el .md y queda pendiente",
+            correlation_id = %item.correlation_id,
+            document_id = %item.document_id,
+            error = %error
+        );
+        match ctx.pipeline.compensate(item).await {
+            Ok(()) => {
+                metrics::counter!("worker_compensations_total", "result" => "ok").increment(1);
+                info!(
+                    service = crate::telemetry::SERVICE,
+                    msg = "md compensado (0 huerfanos)",
+                    correlation_id = %item.correlation_id,
+                    document_id = %item.document_id
+                );
+            }
+            Err(ce) => {
+                metrics::counter!("worker_compensations_total", "result" => "error").increment(1);
                 warn!(
                     service = crate::telemetry::SERVICE,
-                    msg = "el cierre en Mongo fallo; se compensa el .md y queda pendiente",
+                    msg = "la compensacion del txt fallo; revisar el bucket",
                     correlation_id = %item.correlation_id,
                     document_id = %item.document_id,
-                    error = %e
+                    error = %ce
                 );
-                match ctx.pipeline.compensate(&item).await {
-                    Ok(()) => {
-                        metrics::counter!("worker_compensations_total", "result" => "ok")
-                            .increment(1);
-                        info!(
-                            service = crate::telemetry::SERVICE,
-                            msg = "md compensado (0 huerfanos)",
-                            correlation_id = %item.correlation_id,
-                            document_id = %item.document_id
-                        );
-                    }
-                    Err(ce) => {
-                        metrics::counter!("worker_compensations_total", "result" => "error")
-                            .increment(1);
-                        warn!(
-                            service = crate::telemetry::SERVICE,
-                            msg = "la compensacion del txt fallo; revisar el bucket",
-                            correlation_id = %item.correlation_id,
-                            document_id = %item.document_id,
-                            error = %ce
-                        );
-                    }
-                }
             }
         }
     }
@@ -1293,55 +1419,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
                     cause = %error_code,
                     error = %error_message
                 );
-
-                // SPEC 5.4 y 6.3: la mudanza a la DLQ cierra el ciclo del
-                // documento. `Business` (entrada no procesable) cierra desde
-                // PROCESSING a REJECTED; `Transient` (reintentos agotados)
-                // cierra desde RETRYING a EXTRACTION_FAILED, que dispara la
-                // compensacion de la SAGA. Ambas son transiciones declaradas.
-                let (expected, target) = match error_kind {
-                    ErrorKind::Business => (
-                        extraction_core::status::DocumentStatus::Processing,
-                        extraction_core::status::DocumentStatus::Rejected,
-                    ),
-                    ErrorKind::Transient => (
-                        extraction_core::status::DocumentStatus::Retrying,
-                        extraction_core::status::DocumentStatus::ExtractionFailed,
-                    ),
-                };
-                match timeout(
-                    ctx.cfg.mongo_timeout,
-                    ctx.documents.mark_terminal(
-                        &item.document_id,
-                        expected,
-                        target,
-                        error_code,
-                        &item.correlation_id,
-                        &now_rfc3339(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "estado terminal no aplicado: el documento ya no estaba en el estado esperado",
-                        document_id = %item.document_id,
-                        expected = expected.as_str(),
-                        target = target.as_str()
-                    ),
-                    Ok(Err(e)) => warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "no se pudo escribir el estado terminal; queda para el reconciliador",
-                        document_id = %item.document_id,
-                        error = %e
-                    ),
-                    Err(_) => warn!(
-                        service = crate::telemetry::SERVICE,
-                        msg = "timeout escribiendo el estado terminal; queda para el reconciliador",
-                        document_id = %item.document_id
-                    ),
-                }
+                Self::mark_terminal_after_dlq(ctx, item, error_code, error_kind).await;
             }
             Ok(false) => info!(
                 service = crate::telemetry::SERVICE,
@@ -1360,6 +1438,64 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             ),
         }
     }
+
+    /// SPEC 5.4 y 6.3: la mudanza a la DLQ cierra el ciclo del documento.
+    /// `Business` (entrada no procesable) cierra desde PROCESSING a REJECTED;
+    /// `Transient` (reintentos agotados) cierra desde RETRYING a
+    /// EXTRACTION_FAILED, que dispara la compensacion de la SAGA.
+    async fn mark_terminal_after_dlq(
+        ctx: &JobContext<S, K>,
+        item: &WorkItem,
+        error_code: &str,
+        error_kind: ErrorKind,
+    ) {
+        let (expected, target) = terminal_state(error_kind);
+        match timeout(
+            ctx.cfg.mongo_timeout,
+            ctx.documents.mark_terminal(
+                &item.document_id,
+                expected,
+                target,
+                error_code,
+                &item.correlation_id,
+                &now_rfc3339(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "estado terminal no aplicado: el documento ya no estaba en el estado esperado",
+                document_id = %item.document_id,
+                expected = expected.as_str(),
+                target = target.as_str()
+            ),
+            Ok(Err(e)) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "no se pudo escribir el estado terminal; queda para el reconciliador",
+                document_id = %item.document_id,
+                error = %e
+            ),
+            Err(_) => warn!(
+                service = crate::telemetry::SERVICE,
+                msg = "timeout escribiendo el estado terminal; queda para el reconciliador",
+                document_id = %item.document_id
+            ),
+        }
+    }
+}
+
+/// Transiciones terminales declaradas al agotar la DLQ.
+fn terminal_state(error_kind: ErrorKind) -> (DocumentStatus, DocumentStatus) {
+    match error_kind {
+        ErrorKind::Business => (DocumentStatus::Processing, DocumentStatus::Rejected),
+        ErrorKind::Transient => (DocumentStatus::Retrying, DocumentStatus::ExtractionFailed),
+    }
+}
+
+fn attempts_exceeded(attempts: u64, max_attempts: usize) -> bool {
+    attempts > max_attempts as u64
 }
 
 /// Espera a que terminen los jobs en vuelo hasta `budget`; al agotarse los
@@ -1434,6 +1570,26 @@ mod tests {
             degraded_dependency(&minio, &mongo),
             None,
             "half-open no pausa el consumo"
+        );
+    }
+
+    /// S2-P3-07: solo se supera el limite cuando el delivery count es mayor.
+    #[test]
+    fn attempts_exceeded_solo_pasado_el_limite() {
+        assert!(!attempts_exceeded(3, 3));
+        assert!(attempts_exceeded(4, 3));
+    }
+
+    /// SPEC 5.4/6.3: cada causa de DLQ cierra en su transicion declarada.
+    #[test]
+    fn terminal_state_por_causa_de_dlq() {
+        assert_eq!(
+            terminal_state(ErrorKind::Business),
+            (DocumentStatus::Processing, DocumentStatus::Rejected)
+        );
+        assert_eq!(
+            terminal_state(ErrorKind::Transient),
+            (DocumentStatus::Retrying, DocumentStatus::ExtractionFailed)
         );
     }
 
