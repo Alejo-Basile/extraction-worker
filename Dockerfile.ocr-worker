@@ -25,7 +25,7 @@ ENV OCR_PSM=3
 ENV OCR_MAX_ATTEMPTS=3
 ENV METRICS_ADDR=0.0.0.0:8080
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     poppler-utils \
     imagemagick \
     tesseract-ocr \

@@ -52,6 +52,7 @@ FROM debian:trixie-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86
 # ca-certificates: TLS hacia dependencias con https si algun dia se habilita.
 # curl: lo usa el HEALTHCHECK; debian-slim no trae cliente HTTP.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 worker \
