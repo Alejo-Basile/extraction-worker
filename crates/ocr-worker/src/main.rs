@@ -35,9 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP server for health
     HttpServer::new(|| {
-        App::new().route("/healthz", web::get().to(|| async {
-            HttpResponse::Ok().body("ok")
-        }))
+        App::new().route(
+            "/healthz",
+            web::get().to(|| async { HttpResponse::Ok().body("ok") }),
+        )
     })
     .bind(metrics_addr)?
     .run()

@@ -2276,6 +2276,7 @@ dependencies = [
 name = "ocr-worker"
 version = "0.0.0"
 dependencies = [
+ "actix-web",
  "extraction-core",
  "metrics",
  "metrics-exporter-prometheus",
