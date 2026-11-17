@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.90-slim AS builder
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN mkdir -p src && echo "fn main(){}" > src/main.rs
+RUN cargo build --release -p ocr-worker
+
+FROM debian:bookworm-slim
+
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5
+ENV OCR_DPI=150
+ENV OCR_LIMIT_W=3500
+ENV OCR_LIMIT_PIX=12000000
+ENV OCR_LANG=spa+eng
+ENV OCR_OEM=1
+ENV OCR_PSM=3
+ENV OCR_MAX_ATTEMPTS=3
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \
+    imagemagick \
+    tesseract-ocr \
+    tesseract-ocr-spa \
+    tesseract-ocr-eng \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/ocr-worker /usr/local/bin/ocr-worker
+
+EXPOSE 8080
+HEALTHCHECK CMD pgrep ocr-worker || exit 1
+
+ENTRYPOINT ["ocr-worker"]
