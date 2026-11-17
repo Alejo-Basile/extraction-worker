@@ -291,6 +291,28 @@ fn pdf_escaneado_sin_texto_es_error_de_negocio() {
 }
 
 #[test]
+fn texto_extraido_no_conserva_whitespace_de_borde() {
+    let path = temp_path("borde");
+    write_bytes(&path, &text_pdf(2));
+    let ext = PdfExtractor::new(2000);
+    let text = match extract_with_limit(&ext, &path) {
+        Ok(text) => text,
+        Err(e) => panic!("un PDF de texto normal debe extraerse, fallo: {e}"),
+    };
+    let _ = std::fs::remove_file(&path);
+    assert!(!text.is_empty(), "el texto extraido no debe estar vacio");
+    assert!(
+        text.contains("Pagina 0"),
+        "debe conservar el texto del PDF, obtuvo: {text:?}"
+    );
+    assert_eq!(
+        text,
+        text.trim(),
+        "el artefacto .md no debe tener whitespace de borde: {text:?}"
+    );
+}
+
+#[test]
 fn pdf_con_miles_de_paginas_muere_en_el_conteo_previo() {
     let path = temp_path("miles-de-paginas");
     write_bytes(&path, &text_pdf(1200));
