@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
     && cp /src/target/release/extraction-worker /src/extraction-worker
 
 # --- Runtime ------------------------------------------------------------------
-FROM debian:trixie-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
+FROM debian:trixie-slim
 
 # ca-certificates: TLS hacia dependencias con https si algun dia se habilita.
 # curl: lo usa el HEALTHCHECK; debian-slim no trae cliente HTTP.
