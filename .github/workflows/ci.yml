@@ -219,9 +219,20 @@ jobs:
         run: cargo test --all-features -- --ignored
 
   image-scan:
+    # El repo ahora publica dos imagenes independientes (extraction-worker y
+    # ocr-worker); ambas deben construirse y escanearse para no dejar una sin
+    # cobertura de seguridad.
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: extraction-worker
+            dockerfile: Dockerfile
+          - name: ocr-worker
+            dockerfile: Dockerfile.ocr-worker
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -229,8 +240,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           load: true
-          tags: extraction-worker:ci
+          tags: ${{ matrix.name }}:ci
+          cache-from: type=gha,scope=scan-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=scan-${{ matrix.name }}
       # trivy-action v0.33.1 falla al instalar su binario (install.sh termina
       # con exit 1 sin mensaje); se usa la imagen oficial de Trivy contra el
       # daemon de Docker. --ignore-unfixed descarta CVEs que Debian marca
@@ -242,4 +256,4 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:0.76.2 image \
             --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
-            extraction-worker:ci
+            "${{ matrix.name }}:ci"
