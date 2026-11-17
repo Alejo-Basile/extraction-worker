@@ -24,4 +24,12 @@ ignore = [
     "RUSTSEC-2024-0384",
     # ttf-parser via lopdf (pdf-extract): unmaintained, sin vulnerabilidad conocida.
     "RUSTSEC-2026-0192",
+    # actix-http 3.20.3 vulnerabilidades de parsing HTTP/1.1, se aceptan temporalmente
+    # mientras se actualiza actix-web. El servicio solo expone endpoints de health/metrics.
+    "RUSTSEC-2026-0552",
+    "RUSTSEC-2026-0553",
+    "RUSTSEC-2026-0554",
+    # chrono/humantime unmaintained, sin alternativa inmediata en deps transitivas
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0542",
 ]
