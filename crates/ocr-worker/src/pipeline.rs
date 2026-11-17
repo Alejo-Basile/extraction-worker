@@ -8,6 +8,8 @@ use std::process::Command;
 use tempfile::TempDir;
 use tokio::fs as async_fs;
 use tracing::{info, warn};
+use mongodb::{Client, Collection};
+use mongodb::bson::{doc, oid::ObjectId, Document};
 
 #[allow(dead_code)]
 pub struct OcrPipeline {
@@ -113,12 +115,39 @@ impl OcrPipeline {
         let txt_key = format!("extracted-txt/{}.md", item.document_id);
         let object_path_txt = ObjectPath::from(txt_key);
         let len = ocr_text.len();
-        // Simplificado: subir texto directamente
+        // Subir texto a S3
         let bytes = ocr_text.clone().into_bytes();
         let _ = s3_client.put(&object_path_txt, object_store::PutPayload::from(bytes)).await;
 
+        // Update Mongo
+        let mongo_client = Client::with_uri_str(&self.cfg.mongo_uri)
+            .await
+            .map_err(|e| format!("mongo connect error: {e}"))?;
+        let db = mongo_client.database(&self.cfg.mongo_db);
+        let collection: Collection<Document> = db.collection("documents");
+        // Intentar parsear document_id como ObjectId
+        if let Ok(oid) = ObjectId::parse_str(&item.document_id) {
+            let update = doc! {
+                "$set": {
+                    "ocr_text": ocr_text.clone(),
+                    "ocr_text_len": len as i64,
+                    "ocr_extracted_at": mongodb::bson::DateTime::now()
+                }
+            };
+            let _ = collection.update_one(doc! { "_id": oid }, update).await;
+        } else {
+            // Fallback por campo document_id string
+            let update = doc! {
+                "$set": {
+                    "ocr_text": ocr_text,
+                    "ocr_text_len": len as i64,
+                    "ocr_extracted_at": mongodb::bson::DateTime::now()
+                }
+            };
+            let _ = collection.update_one(doc! { "document_id": &item.document_id }, update).await;
+        }
+
         info!("OCR generado {} chars para {}", len, item.document_id);
-        // TODO: Update Mongo
 
         Ok(())
     }
