@@ -2301,6 +2301,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocr-worker"
+version = "0.0.0"
+dependencies = [
+ "extraction-core",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "mongodb",
+ "object_store",
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
