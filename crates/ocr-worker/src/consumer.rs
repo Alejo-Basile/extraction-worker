@@ -72,6 +72,12 @@ impl OcrConsumer {
                                 Ok(_) => {
                                     counter!("worker_ocr_processed_total").increment(1);
                                     histogram!("worker_ocr_duration_seconds").record(start.elapsed().as_secs_f64());
+                                    // Limpiar contador de intentos
+                                    let attempts_key = format!("ocr:attempts:{}", msg_id);
+                                    let _: redis::RedisResult<()> = redis::cmd("DEL")
+                                        .arg(&attempts_key)
+                                        .query_async(&mut con)
+                                        .await;
                                     let _: redis::RedisResult<()> = redis::cmd("XACK")
                                         .arg(&self.cfg.redis_ocr_stream)
                                         .arg(&self.cfg.redis_ocr_group)
@@ -82,24 +88,45 @@ impl OcrConsumer {
                                 Err(e) => {
                                     counter!("worker_ocr_errors_total").increment(1);
                                     error!("Error OCR para {}: {}", item.document_id, e);
-                                    // Envío a DLQ
-                                    let _: redis::RedisResult<()> = redis::cmd("XADD")
-                                        .arg(&self.cfg.redis_ocr_dlq_stream)
-                                        .arg("*")
-                                        .arg("original_id")
-                                        .arg(&msg_id)
-                                        .arg("document_id")
-                                        .arg(&item.document_id)
-                                        .arg("error")
-                                        .arg(&e)
+                                    // Incrementar intentos
+                                    let attempts_key = format!("ocr:attempts:{}", msg_id);
+                                    let attempts: i64 = redis::cmd("HINCRBY")
+                                        .arg(&attempts_key)
+                                        .arg("count")
+                                        .arg(1)
                                         .query_async(&mut con)
-                                        .await;
-                                    let _: redis::RedisResult<()> = redis::cmd("XACK")
-                                        .arg(&self.cfg.redis_ocr_stream)
-                                        .arg(&self.cfg.redis_ocr_group)
-                                        .arg(&msg_id)
-                                        .query_async(&mut con)
-                                        .await;
+                                        .await
+                                        .unwrap_or(1);
+                                    if attempts >= self.cfg.ocr_max_attempts as i64 {
+                                        // Envío a DLQ
+                                        let _: redis::RedisResult<()> = redis::cmd("XADD")
+                                            .arg(&self.cfg.redis_ocr_dlq_stream)
+                                            .arg("*")
+                                            .arg("original_id")
+                                            .arg(&msg_id)
+                                            .arg("document_id")
+                                            .arg(&item.document_id)
+                                            .arg("error")
+                                            .arg(&e)
+                                            .arg("attempts")
+                                            .arg(attempts.to_string())
+                                            .query_async(&mut con)
+                                            .await;
+                                        let _: redis::RedisResult<()> = redis::cmd("XACK")
+                                            .arg(&self.cfg.redis_ocr_stream)
+                                            .arg(&self.cfg.redis_ocr_group)
+                                            .arg(&msg_id)
+                                            .query_async(&mut con)
+                                            .await;
+                                        // Limpiar contador
+                                        let _: redis::RedisResult<()> = redis::cmd("DEL")
+                                            .arg(&attempts_key)
+                                            .query_async(&mut con)
+                                            .await;
+                                    } else {
+                                        warn!("Reintentando documento {} intento {}/{}", item.document_id, attempts, self.cfg.ocr_max_attempts);
+                                        // No ACK para reintento
+                                    }
                                 }
                             }
                         }
