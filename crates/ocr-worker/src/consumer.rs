@@ -4,12 +4,12 @@ use crate::pipeline::OcrPipeline;
 #[allow(unused_imports)]
 use extraction_core::WorkItem;
 use metrics::{counter, histogram};
-use redis::{aio, streams::{StreamReadOptions, StreamReadReply}};
+use redis::streams::StreamReadReply;
 #[allow(unused_imports)]
 use serde_json;
-use tracing::{error, info, warn};
 #[allow(unused_imports)]
 use std::time::Instant;
+use tracing::{error, info, warn};
 
 #[allow(dead_code)]
 pub struct OcrConsumer {
@@ -22,11 +22,14 @@ impl OcrConsumer {
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("OCR consumer starting, stream={}", self.cfg.redis_ocr_stream);
-        
+        info!(
+            "OCR consumer starting, stream={}",
+            self.cfg.redis_ocr_stream
+        );
+
         let client = redis::Client::open(self.cfg.redis_url.clone())?;
         let mut con = client.get_multiplexed_async_connection().await?;
-        
+
         // Asegurar grupo
         let _: redis::RedisResult<()> = redis::cmd("XGROUP")
             .arg("CREATE")
@@ -36,9 +39,9 @@ impl OcrConsumer {
             .arg("MKSTREAM")
             .query_async(&mut con)
             .await;
-        
+
         let consumer_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "ocr-worker-1".into());
-        
+
         loop {
             let reply: StreamReadReply = redis::cmd("XREADGROUP")
                 .arg("GROUP")
@@ -53,27 +56,29 @@ impl OcrConsumer {
                 .arg(">")
                 .query_async(&mut con)
                 .await?;
-            
+
             counter!("worker_ocr_poll_total").increment(1);
-            
+
             for stream in &reply.keys {
                 for message in &stream.ids {
                     let msg_id = message.id.clone();
-                    let payload_str = if let Some(redis::Value::BulkString(b)) = message.map.get("payload") {
-                        String::from_utf8_lossy(b).into_owned()
-                    } else {
-                        String::new()
-                    };
-                    
+                    let payload_str =
+                        if let Some(redis::Value::BulkString(b)) = message.map.get("payload") {
+                            String::from_utf8_lossy(b).into_owned()
+                        } else {
+                            String::new()
+                        };
+
                     let start = Instant::now();
                     match serde_json::from_str::<WorkItem>(&payload_str) {
                         Ok(item) => {
                             info!("Procesando documento {}", item.document_id);
-                            let mut pipeline = OcrPipeline::new(self.cfg.clone());
+                            let pipeline = OcrPipeline::new(self.cfg.clone());
                             match pipeline.run(&item).await {
                                 Ok(_) => {
                                     counter!("worker_ocr_processed_total").increment(1);
-                                    histogram!("worker_ocr_duration_seconds").record(start.elapsed().as_secs_f64());
+                                    histogram!("worker_ocr_duration_seconds")
+                                        .record(start.elapsed().as_secs_f64());
                                     // Limpiar contador de intentos
                                     let attempts_key = format!("ocr:attempts:{}", msg_id);
                                     let _: redis::RedisResult<()> = redis::cmd("DEL")
@@ -126,7 +131,10 @@ impl OcrConsumer {
                                             .query_async(&mut con)
                                             .await;
                                     } else {
-                                        warn!("Reintentando documento {} intento {}/{}", item.document_id, attempts, self.cfg.ocr_max_attempts);
+                                        warn!(
+                                            "Reintentando documento {} intento {}/{}",
+                                            item.document_id, attempts, self.cfg.ocr_max_attempts
+                                        );
                                         // No ACK para reintento
                                     }
                                 }
