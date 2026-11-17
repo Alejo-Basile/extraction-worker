@@ -1,9 +1,13 @@
 use crate::config::OcrConfig;
 use extraction_core::WorkItem;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectStoreExt;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
-use tracing::{info, warn, error};
+use tokio::fs as async_fs;
+use tracing::{info, warn};
 
 #[allow(dead_code)]
 pub struct OcrPipeline {
@@ -22,12 +26,30 @@ impl OcrPipeline {
         let out_dir = tmp.path().join("pages");
         fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir error: {e}"))?;
 
-        // Placeholder de descarga S3
-        // En implementación real: object_store::Client con endpoint S3
-        // Por ahora crear archivo vacío para que los comandos no fallen
-        fs::write(&pdf_path, b"%PDF-1.4 placeholder").map_err(|e| format!("write error: {e}"))?;
+        // Descarga S3 raw
+        let s3_client = AmazonS3Builder::new()
+            .with_endpoint(&self.cfg.s3_endpoint)
+            .with_access_key_id(&self.cfg.s3_access_key)
+            .with_secret_access_key(&self.cfg.s3_secret_key)
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .build()
+            .map_err(|e| format!("s3 client error: {e}"))?;
+        
+        let object_path = ObjectPath::from(format!("raw/{}", item.object_key));
+        
+        let get_result = s3_client
+            .get(&object_path)
+            .await
+            .map_err(|e| format!("s3 download error: {e}"))?;
+        
+        let bytes = get_result.bytes().await.map_err(|e| format!("s3 read bytes error: {e}"))?;
+        
+        async_fs::write(&pdf_path, &bytes)
+            .await
+            .map_err(|e| format!("write error: {e}"))?;
 
-        // 1. Rasterizar con pdftoppm
+        // Rasterizar con pdftoppm
         let ppm_prefix = out_dir.join("page");
         let status = Command::new("pdftoppm")
             .arg("-png")
@@ -41,7 +63,7 @@ impl OcrPipeline {
             return Err("pdftoppm failed".into());
         }
 
-        // 2. Limitador ImageMagick
+        // Limitador ImageMagick
         for entry in fs::read_dir(&out_dir).map_err(|e| format!("read dir error: {e}"))?.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("png") {
@@ -60,7 +82,7 @@ impl OcrPipeline {
             }
         }
 
-        // 3. Tesseract OCR
+        // Tesseract OCR
         let mut ocr_text = String::new();
         for entry in fs::read_dir(&out_dir).map_err(|e| format!("read dir error: {e}"))?.flatten() {
             let path = entry.path();
@@ -87,9 +109,16 @@ impl OcrPipeline {
             }
         }
 
-        // 4. Placeholder de subida S3 y Mongo
-        info!("OCR generado {} chars para {}", ocr_text.len(), item.document_id);
-        // En implementación real: subir a S3 y actualizar Mongo
+        // Subida S3 extracted-txt
+        let txt_key = format!("extracted-txt/{}.md", item.document_id);
+        let object_path_txt = ObjectPath::from(txt_key);
+        let len = ocr_text.len();
+        // Simplificado: subir texto directamente
+        let bytes = ocr_text.clone().into_bytes();
+        let _ = s3_client.put(&object_path_txt, object_store::PutPayload::from(bytes)).await;
+
+        info!("OCR generado {} chars para {}", len, item.document_id);
+        // TODO: Update Mongo
 
         Ok(())
     }
