@@ -1,5 +1,7 @@
 use crate::config::OcrConfig;
 use extraction_core::WorkItem;
+use mongodb::bson::{doc, oid::ObjectId, Document};
+use mongodb::{Client, Collection};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStoreExt;
@@ -8,8 +10,6 @@ use std::process::Command;
 use tempfile::TempDir;
 use tokio::fs as async_fs;
 use tracing::{info, warn};
-use mongodb::{Client, Collection};
-use mongodb::bson::{doc, oid::ObjectId, Document};
 
 #[allow(dead_code)]
 pub struct OcrPipeline {
@@ -37,16 +37,19 @@ impl OcrPipeline {
             .with_allow_http(true)
             .build()
             .map_err(|e| format!("s3 client error: {e}"))?;
-        
+
         let object_path = ObjectPath::from(format!("raw/{}", item.object_key));
-        
+
         let get_result = s3_client
             .get(&object_path)
             .await
             .map_err(|e| format!("s3 download error: {e}"))?;
-        
-        let bytes = get_result.bytes().await.map_err(|e| format!("s3 read bytes error: {e}"))?;
-        
+
+        let bytes = get_result
+            .bytes()
+            .await
+            .map_err(|e| format!("s3 read bytes error: {e}"))?;
+
         async_fs::write(&pdf_path, &bytes)
             .await
             .map_err(|e| format!("write error: {e}"))?;
@@ -58,7 +61,7 @@ impl OcrPipeline {
             .arg("-r")
             .arg(self.cfg.ocr_dpi.to_string())
             .arg(&pdf_path)
-            .arg(ppm_prefix.to_str().unwrap())
+            .arg(&ppm_prefix)
             .status()
             .map_err(|e| format!("pdftoppm error: {e}"))?;
         if !status.success() {
@@ -66,15 +69,21 @@ impl OcrPipeline {
         }
 
         // Limitador ImageMagick
-        for entry in fs::read_dir(&out_dir).map_err(|e| format!("read dir error: {e}"))?.flatten() {
+        for entry in fs::read_dir(&out_dir)
+            .map_err(|e| format!("read dir error: {e}"))?
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("png") {
                 let status = Command::new("convert")
                     .arg(&path)
                     .arg("-resize")
-                    .arg(&format!("{}x{}>", self.cfg.ocr_limit_w, self.cfg.ocr_limit_w))
+                    .arg(format!(
+                        "{}x{}>",
+                        self.cfg.ocr_limit_w, self.cfg.ocr_limit_w
+                    ))
                     .arg("-resize")
-                    .arg(&format!("{}@>", self.cfg.ocr_limit_pix))
+                    .arg(format!("{}@>", self.cfg.ocr_limit_pix))
                     .arg(&path)
                     .status()
                     .map_err(|e| format!("convert error: {e}"))?;
@@ -86,7 +95,10 @@ impl OcrPipeline {
 
         // Tesseract OCR
         let mut ocr_text = String::new();
-        for entry in fs::read_dir(&out_dir).map_err(|e| format!("read dir error: {e}"))?.flatten() {
+        for entry in fs::read_dir(&out_dir)
+            .map_err(|e| format!("read dir error: {e}"))?
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("png") {
                 let output_base = path.with_extension("");
@@ -117,7 +129,9 @@ impl OcrPipeline {
         let len = ocr_text.len();
         // Subir texto a S3
         let bytes = ocr_text.clone().into_bytes();
-        let _ = s3_client.put(&object_path_txt, object_store::PutPayload::from(bytes)).await;
+        let _ = s3_client
+            .put(&object_path_txt, object_store::PutPayload::from(bytes))
+            .await;
 
         // Update Mongo
         let mongo_client = Client::with_uri_str(&self.cfg.mongo_uri)
@@ -144,7 +158,9 @@ impl OcrPipeline {
                     "ocr_extracted_at": mongodb::bson::DateTime::now()
                 }
             };
-            let _ = collection.update_one(doc! { "document_id": &item.document_id }, update).await;
+            let _ = collection
+                .update_one(doc! { "document_id": &item.document_id }, update)
+                .await;
         }
 
         info!("OCR generado {} chars para {}", len, item.document_id);
