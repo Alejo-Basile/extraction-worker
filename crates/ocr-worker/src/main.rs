@@ -64,12 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = OcrConfig::from_env();
     info!("ocr-worker iniciando con stream {}", cfg.redis_ocr_stream);
-
     metrics::counter!("worker_ocr_started_total").increment(1);
 
-    // Placeholder de bucle de consumo Redis Streams
-    // En implementación real: XREADGROUP BLOCK con manejo de reintentos y DLQ
-    tracing::info!("configuración cargada: {:?}", cfg);
+    // Placeholder de bucle de consumo
+    // Futuro: XREADGROUP BLOCK, deserialización de WorkItem, pipeline S3→raster→OCR→S3→Mongo, ACK/DLQ
+    info!("configuración cargada: {:?}", cfg);
 
     // Simulación de procesamiento
     let dummy_item = WorkItem {
@@ -86,8 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("procesamiento dummy ok");
         }
         Err(e) => {
-            counter!("worker_ocr_errors_total", "code" => format!("{:?}", e)).increment(1);
-            warn!("error procesando dummy: {:?}", e);
+            counter!("worker_ocr_errors_total").increment(1);
+            warn!("error procesando dummy: {}", e);
         }
     }
 
