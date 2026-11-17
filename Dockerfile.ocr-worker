@@ -1,13 +1,19 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.90-slim AS builder
+# --- Builder ---
+FROM rust:1.90-bookworm AS builder
+WORKDIR /src
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config build-essential && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN mkdir -p src && echo "fn main(){}" > src/main.rs
-RUN cargo build --release -p ocr-worker
 
-FROM debian:bookworm-slim
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release --locked -p ocr-worker
+
+# --- Runtime ---
+FROM debian:trixie-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
 
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5
 ENV OCR_DPI=150
@@ -17,6 +23,7 @@ ENV OCR_LANG=spa+eng
 ENV OCR_OEM=1
 ENV OCR_PSM=3
 ENV OCR_MAX_ATTEMPTS=3
+ENV METRICS_ADDR=0.0.0.0:8080
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
@@ -25,11 +32,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-spa \
     tesseract-ocr-eng \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 worker \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin worker
 
-COPY --from=builder /app/target/release/ocr-worker /usr/local/bin/ocr-worker
+COPY --from=builder /src/target/release/ocr-worker /usr/local/bin/ocr-worker
 
 EXPOSE 8080
-HEALTHCHECK CMD pgrep ocr-worker || exit 1
 
+HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=15s \
+    CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+
+USER 10001:10001
 ENTRYPOINT ["ocr-worker"]

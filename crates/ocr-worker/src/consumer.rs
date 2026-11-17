@@ -24,8 +24,8 @@ impl OcrConsumer {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("OCR consumer starting, stream={}", self.cfg.redis_ocr_stream);
         
-        let client = redis::Client::open(&self.cfg.redis_url)?;
-        let mut con = aio::MultiplexedConnection::new(client.get_connection().await?).await?;
+        let client = redis::Client::open(self.cfg.redis_url.clone())?;
+        let mut con = client.get_multiplexed_async_connection().await?;
         
         // Asegurar grupo
         let _: redis::RedisResult<()> = redis::cmd("XGROUP")
@@ -59,12 +59,14 @@ impl OcrConsumer {
             for stream in &reply.keys {
                 for message in &stream.ids {
                     let msg_id = message.id.clone();
-                    let payload = message.map.get("payload")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let payload_str = if let Some(redis::Value::BulkString(b)) = message.map.get("payload") {
+                        String::from_utf8_lossy(b).into_owned()
+                    } else {
+                        String::new()
+                    };
                     
                     let start = Instant::now();
-                    match serde_json::from_str::<WorkItem>(payload) {
+                    match serde_json::from_str::<WorkItem>(&payload_str) {
                         Ok(item) => {
                             info!("Procesando documento {}", item.document_id);
                             let mut pipeline = OcrPipeline::new(self.cfg.clone());
