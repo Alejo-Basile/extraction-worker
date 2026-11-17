@@ -42,6 +42,16 @@ pub mod error_code {
     pub const PDF_TOO_MANY_PAGES: &str = "PDF_TOO_MANY_PAGES";
     /// El texto extraido supera `WORKER_MAX_OUTPUT_BYTES`.
     pub const PDF_OUTPUT_TOO_LARGE: &str = "PDF_OUTPUT_TOO_LARGE";
+    /// OCR no habilitado en el worker y el PDF requiere OCR.
+    pub const OCR_DISABLED: &str = "OCR_DISABLED";
+    /// El handoff a OCR fallo por cola llena o error de Redis.
+    pub const OCR_QUEUE_FULL: &str = "OCR_QUEUE_FULL";
+    /// Fallo de OCR durante procesamiento: error del rasterizador o Tesseract.
+    pub const OCR_FAILED: &str = "OCR_FAILED";
+    /// Timeout de OCR excedido.
+    pub const OCR_TIMEOUT: &str = "OCR_TIMEOUT";
+    /// El worker OCR rechazó el documento por límites.
+    pub const OCR_REJECTED: &str = "OCR_REJECTED";
 }
 
 /// Mensaje en la DLQ (seccion 11.3). Anade el diagnostico al mensaje original;
@@ -72,7 +82,7 @@ pub struct DlqMessage {
 /// - El binario nunca viaja por la cola, solo metadatos.
 /// - NO lleva `attempts`: el conteo de intentos es el delivery count de
 ///   `XPENDING` (SPEC seccion 5.4).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkItem {
     /// ULID del documento; tambien es el `_id` en Mongo y la base del

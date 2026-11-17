@@ -42,6 +42,11 @@ clasificación `Document | Transient | Fatal | CircuitOpen` vive en
 | `PDF_TOO_MANY_PAGES` | PDF supera `WORKER_MAX_PAGES` | no | dividir el documento o ajustar límite |
 | `PDF_OUTPUT_TOO_LARGE` | Texto extraído supera `WORKER_MAX_OUTPUT_BYTES` | no | revisar el PDF o ajustar límite |
 | `MAX_ATTEMPTS_EXCEEDED` | Se agotó `WORKER_MAX_ATTEMPTS` por fallos de infraestructura | no (para ese intento) | revisar dependencia y usar replay de DLQ |
+| `OCR_DISABLED` | OCR requerido pero deshabilitado por configuración | no | habilitar OCR o marcar documento como no procesable |
+| `OCR_QUEUE_FULL` | Handoff a OCR falló por cola llena o error Redis | sí si `OCR_MODE=best_effort` | verificar profundidad de cola y capacidad OCR |
+| `OCR_FAILED` | Fallo de OCR durante procesamiento | no | revisar logs OCR, intentar replay manual |
+| `OCR_TIMEOUT` | Timeout de OCR excedido | sí | ajustar `WORKER_OCR_TIMEOUT_SECS` o revisar recurso |
+| `OCR_REJECTED` | Worker OCR rechazó documento por límites (páginas/tamaño) | no | dividir documento o ajustar límites OCR |
 
 ## Códigos de infraestructura
 

@@ -1055,6 +1055,28 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) {
         match failure {
             Failure::Document { code, message } => {
+                // Handoff a OCR si el PDF no tiene texto y OCR está habilitado
+                if code == extraction_core::error_code::PDF_NO_TEXT
+                    && ctx.cfg.ocr_enabled
+                    && ctx.cfg.ocr_mode != "disabled"
+                {
+                    if let Err(e) = Self::handoff_to_ocr(ctx, rc, msg_id, item).await {
+                        // Si el handoff falla, se manda a DLQ con código OCR_QUEUE_FULL
+                        metrics::counter!("worker_documents_total", "outcome" => "rejected")
+                            .increment(1);
+                        Self::dlq_and_log(
+                            ctx,
+                            rc,
+                            msg_id,
+                            item,
+                            extraction_core::error_code::OCR_QUEUE_FULL,
+                            &format!("handoff a OCR falló: {e}"),
+                            ErrorKind::Business,
+                        )
+                        .await;
+                    }
+                    return;
+                }
                 metrics::counter!("worker_documents_total", "outcome" => "rejected").increment(1);
                 Self::dlq_and_log(ctx, rc, msg_id, item, &code, &message, ErrorKind::Business)
                     .await;
@@ -1526,6 +1548,60 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
+    /// Handoff atómico a OCR: XADD a `stream:ocr-processing` y XACK del mensaje original.
+    /// Devuelve Ok(()) si el handoff se realizó, o Err con el error de Redis.
+    async fn handoff_to_ocr(
+        ctx: &JobContext<S, K>,
+        rc: &MasterConn,
+        msg_id: &str,
+        item: &WorkItem,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_string(item)
+            .map_err(|e| format!("serializacion del WorkItem falló: {e}"))?;
+        let stream = ctx.cfg.ocr_stream.clone();
+        let stream_src = ctx.cfg.stream.clone();
+        let group = ctx.cfg.group.clone();
+        let msg_id = msg_id.to_string();
+        rc.run(&ctx.redis_breaker, |mut c| {
+            let stream = stream.clone();
+            let stream_src = stream_src.clone();
+            let group = group.clone();
+            let msg_id = msg_id.clone();
+            let payload = payload.clone();
+            async move {
+                // XADD * payload <json>
+                let _: Result<String, redis::RedisError> = redis::cmd("XADD")
+                    .arg(&stream)
+                    .arg("*")
+                    .arg("payload")
+                    .arg(&payload)
+                    .query_async(&mut c)
+                    .await;
+                // Acknowledge del mensaje original para evitar reintentos
+                let _: Result<(), redis::RedisError> = redis::cmd("XACK")
+                    .arg(&stream_src)
+                    .arg(&group)
+                    .arg(&msg_id)
+                    .query_async(&mut c)
+                    .await;
+                Ok::<(), Failure>(())
+            }
+        })
+        .await
+        .map_err(|e| format!("redis error en handoff OCR: {e}"))?;
+        info!(
+            service = crate::telemetry::SERVICE,
+            msg = "handoff a OCR realizado",
+            correlation_id = %item.correlation_id,
+            document_id = %item.document_id,
+            ocr_stream = %ctx.cfg.ocr_stream
+        );
+        metrics::counter!("worker_ocr_handoff_total", "result" => "ok").increment(1);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

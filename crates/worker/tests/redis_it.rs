@@ -49,6 +49,10 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         xautoclaim_interval: Duration::from_secs(1),
         max_attempts: 2,
         dlq_stream: format!("{stream}-dlq"),
+        ocr_enabled: false,
+        ocr_mode: "disabled".to_string(),
+        ocr_stream: "stream:ocr-processing".to_string(),
+        ocr_group: "ocr-workers".to_string(),
         max_concurrency: 2,
         max_pdf_bytes: 1024 * 1024,
         s3_endpoint: std::env::var("S3_ENDPOINT")

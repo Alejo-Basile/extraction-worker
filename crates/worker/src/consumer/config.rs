@@ -26,6 +26,14 @@ pub struct ConsumerConfig {
     pub xautoclaim_interval: Duration,
     pub max_attempts: usize,
     pub dlq_stream: String,
+    /// Habilita handoff a OCR cuando el PDF no tiene texto extraible.
+    pub ocr_enabled: bool,
+    /// Modo de OCR: `disabled`, `fallback` (solo si PDF_NO_TEXT), `always`.
+    pub ocr_mode: String,
+    /// Stream de Redis donde se publica el trabajo de OCR.
+    pub ocr_stream: String,
+    /// Grupo consumidor de OCR (referencial).
+    pub ocr_group: String,
     /// Bulkhead por instancia (S2-P3-03): extracciones en paralelo.
     pub max_concurrency: usize,
     /// Limite duro del PDF descargado (defensa en profundidad, S2-P3-01).
@@ -154,6 +162,10 @@ impl ConsumerConfig {
             )),
             max_attempts: env_usize_or("WORKER_MAX_ATTEMPTS", 5),
             dlq_stream: env_or("REDIS_DLQ_STREAM", "stream:pdf-processing-dlq"),
+            ocr_enabled: env_or("WORKER_OCR_ENABLED", "false").parse::<bool>().unwrap_or(false),
+            ocr_mode: env_or("WORKER_OCR_MODE", "disabled"),
+            ocr_stream: env_or("REDIS_OCR_STREAM", "stream:ocr-processing"),
+            ocr_group: env_or("REDIS_OCR_GROUP", "ocr-workers"),
             max_concurrency: env_usize_or("WORKER_MAX_CONCURRENCY", 4),
             max_pdf_bytes: env_u64_or("WORKER_MAX_PDF_BYTES", 30 * 1024 * 1024),
             s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
