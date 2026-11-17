@@ -1,12 +1,17 @@
 use crate::config::OcrConfig;
+#[allow(unused_imports)]
 use crate::pipeline::OcrPipeline;
+#[allow(unused_imports)]
 use extraction_core::WorkItem;
 use metrics::{counter, histogram};
 use redis::{aio, streams::{StreamReadOptions, StreamReadReply}};
+#[allow(unused_imports)]
 use serde_json;
 use tracing::{error, info, warn};
+#[allow(unused_imports)]
 use std::time::Instant;
 
+#[allow(dead_code)]
 pub struct OcrConsumer {
     cfg: OcrConfig,
 }

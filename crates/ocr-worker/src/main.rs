@@ -1,6 +1,6 @@
+use crate::config::OcrConfig;
 use extraction_core::WorkItem;
 use metrics::counter;
-use config::OcrConfig;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 

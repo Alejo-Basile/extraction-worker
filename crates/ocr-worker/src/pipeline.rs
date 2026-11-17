@@ -2,6 +2,7 @@ use crate::config::OcrConfig;
 use extraction_core::WorkItem;
 use tracing::{info, warn};
 
+#[allow(dead_code)]
 pub struct OcrPipeline {
     cfg: OcrConfig,
 }
