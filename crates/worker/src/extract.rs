@@ -65,7 +65,7 @@ impl TextExtractor for PdfExtractor {
                 kind: ErrorKind::Business,
             });
         }
-        Ok(text)
+        Ok(text.trim().to_string())
     }
 }
 
@@ -112,6 +112,25 @@ mod tests {
             Ok(text) => assert!(!text.trim().is_empty(), "el fixture debe tener texto"),
             Err(e) => panic!("extraccion del fixture fallo: {e}"),
         }
+    }
+
+    #[test]
+    fn texto_extraido_no_tiene_whitespace_de_borde() {
+        let ext = PdfExtractor::new(2000);
+        let path = fixture_path();
+        if !path.exists() {
+            panic!("fixture ausente: {}", path.display());
+        }
+        let text = match ext.extract(&path) {
+            Ok(text) => text,
+            Err(e) => panic!("extraccion del fixture fallo: {e}"),
+        };
+        assert!(!text.is_empty(), "el texto extraido no debe estar vacio");
+        assert_eq!(
+            text,
+            text.trim(),
+            "el artefacto .md no debe tener whitespace de borde: {text:?}"
+        );
     }
 
     #[test]

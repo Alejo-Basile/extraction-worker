@@ -23,6 +23,7 @@ fija la clasificación y el destino.
 | Acción `/Launch` | `/OpenAction` con `calc.exe`/`cmd.exe` | se ignora; no se ejecuta ni se filtra | `pdf_con_accion_launch_no_se_ejecuta` |
 | Hostil con trabajo lento | extractor lento en el pipeline | `JOB_TIMEOUT`, transient → mensaje queda pendiente | `job_timeout_devuelve_transitorio` |
 | Liveness con hostil | job en timeout | `/healthz` sigue respondiendo | `healthz_responde_durante_timeout_de_job` |
+| Texto con whitespace de borde | `minimal.pdf` y PDF de texto de 2 páginas (`build_pdf`/`text_pdf`) | el artefacto `.md` no conserva whitespace al inicio ni al final (`text == text.trim()`); el contenido se preserva | `texto_extraido_no_tiene_whitespace_de_borde`, `texto_extraido_no_conserva_whitespace_de_borde` |
 
 Notas:
 
