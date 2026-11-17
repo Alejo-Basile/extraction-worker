@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release --locked -p ocr-worker
 
 # --- Runtime ---
-FROM debian:trixie-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
+FROM debian:trixie-slim
 
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5
 ENV OCR_DPI=150
