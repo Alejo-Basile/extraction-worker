@@ -39,11 +39,6 @@ impl OcrConsumer {
         
         let consumer_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "ocr-worker-1".into());
         
-        let mut opts = StreamReadOptions::default();
-        opts.group(&self.cfg.redis_ocr_group, &consumer_name);
-        opts.count(self.cfg.consumer_count as u32);
-        opts.block(std::time::Duration::from_millis(self.cfg.consumer_block_ms));
-        
         loop {
             let reply: StreamReadReply = redis::cmd("XREADGROUP")
                 .arg("GROUP")
@@ -59,12 +54,94 @@ impl OcrConsumer {
                 .query_async(&mut con)
                 .await?;
             
-            // Simplificación: procesar mensajes
-            // En implementación real, iterar sobre reply.keys
             counter!("worker_ocr_poll_total").increment(1);
-            // Placeholder para evitar error de compilación
-            // Aquí iría el procesamiento real
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            
+            for stream in &reply.keys {
+                for message in &stream.ids {
+                    let msg_id = message.id.clone();
+                    let payload = message.map.get("payload")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    
+                    let start = Instant::now();
+                    match serde_json::from_str::<WorkItem>(payload) {
+                        Ok(item) => {
+                            info!("Procesando documento {}", item.document_id);
+                            let mut pipeline = OcrPipeline::new(self.cfg.clone());
+                            match pipeline.run(&item).await {
+                                Ok(_) => {
+                                    counter!("worker_ocr_processed_total").increment(1);
+                                    histogram!("worker_ocr_duration_seconds").record(start.elapsed().as_secs_f64());
+                                    // Limpiar contador de intentos
+                                    let attempts_key = format!("ocr:attempts:{}", msg_id);
+                                    let _: redis::RedisResult<()> = redis::cmd("DEL")
+                                        .arg(&attempts_key)
+                                        .query_async(&mut con)
+                                        .await;
+                                    let _: redis::RedisResult<()> = redis::cmd("XACK")
+                                        .arg(&self.cfg.redis_ocr_stream)
+                                        .arg(&self.cfg.redis_ocr_group)
+                                        .arg(&msg_id)
+                                        .query_async(&mut con)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    counter!("worker_ocr_errors_total").increment(1);
+                                    error!("Error OCR para {}: {}", item.document_id, e);
+                                    // Incrementar intentos
+                                    let attempts_key = format!("ocr:attempts:{}", msg_id);
+                                    let attempts: i64 = redis::cmd("HINCRBY")
+                                        .arg(&attempts_key)
+                                        .arg("count")
+                                        .arg(1)
+                                        .query_async(&mut con)
+                                        .await
+                                        .unwrap_or(1);
+                                    if attempts >= self.cfg.ocr_max_attempts as i64 {
+                                        // Envío a DLQ
+                                        let _: redis::RedisResult<()> = redis::cmd("XADD")
+                                            .arg(&self.cfg.redis_ocr_dlq_stream)
+                                            .arg("*")
+                                            .arg("original_id")
+                                            .arg(&msg_id)
+                                            .arg("document_id")
+                                            .arg(&item.document_id)
+                                            .arg("error")
+                                            .arg(&e)
+                                            .arg("attempts")
+                                            .arg(attempts.to_string())
+                                            .query_async(&mut con)
+                                            .await;
+                                        let _: redis::RedisResult<()> = redis::cmd("XACK")
+                                            .arg(&self.cfg.redis_ocr_stream)
+                                            .arg(&self.cfg.redis_ocr_group)
+                                            .arg(&msg_id)
+                                            .query_async(&mut con)
+                                            .await;
+                                        // Limpiar contador
+                                        let _: redis::RedisResult<()> = redis::cmd("DEL")
+                                            .arg(&attempts_key)
+                                            .query_async(&mut con)
+                                            .await;
+                                    } else {
+                                        warn!("Reintentando documento {} intento {}/{}", item.document_id, attempts, self.cfg.ocr_max_attempts);
+                                        // No ACK para reintento
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Payload inválido: {}", e);
+                            let _: redis::RedisResult<()> = redis::cmd("XACK")
+                                .arg(&self.cfg.redis_ocr_stream)
+                                .arg(&self.cfg.redis_ocr_group)
+                                .arg(&msg_id)
+                                .query_async(&mut con)
+                                .await;
+                        }
+                    }
+                }
+            }
         }
     }
 }
