@@ -1,16 +1,12 @@
 use crate::config::OcrConfig;
-use extraction_core::WorkItem;
-use metrics::counter;
-use tracing::{info, warn};
+use crate::consumer::OcrConsumer;
+use actix_web::{web, App, HttpResponse, HttpServer};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing_subscriber::EnvFilter;
 
 pub mod config;
+pub mod consumer;
 pub mod pipeline;
-
-async fn process_item(cfg: &OcrConfig, item: &WorkItem) -> Result<(), String> {
-    let pipe = pipeline::OcrPipeline::new(cfg.clone());
-    pipe.run(item).await
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,29 +15,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = OcrConfig::from_env();
-    info!("ocr-worker iniciando con stream {}", cfg.redis_ocr_stream);
+    tracing::info!("ocr-worker iniciando con stream {}", cfg.redis_ocr_stream);
     metrics::counter!("worker_ocr_started_total").increment(1);
 
-    info!("configuración cargada: {:?}", cfg);
+    // Prometheus metrics recorder
+    let _ = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| format!("prometheus recorder error: {e}"));
 
-    let dummy_item = WorkItem {
-        document_id: "dummy".into(),
-        object_key: "dummy.pdf".into(),
-        correlation_id: "dummy".into(),
-        enqueued_at: "2026-01-01T00:00:00Z".into(),
-        schema_version: 1,
-    };
+    let metrics_addr = std::env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    match process_item(&cfg, &dummy_item).await {
-        Ok(_) => {
-            counter!("worker_ocr_processed_total").increment(1);
-            info!("procesamiento dummy ok");
+    // Consumer task
+    let consumer = OcrConsumer::new(cfg.clone());
+    tokio::spawn(async move {
+        if let Err(e) = consumer.run().await {
+            tracing::error!("consumer error: {}", e);
         }
-        Err(e) => {
-            counter!("worker_ocr_errors_total").increment(1);
-            warn!("error procesando dummy: {}", e);
-        }
-    }
+    });
+
+    // HTTP server for health
+    HttpServer::new(|| {
+        App::new().route("/healthz", web::get().to(|| async {
+            HttpResponse::Ok().body("ok")
+        }))
+    })
+    .bind(metrics_addr)?
+    .run()
+    .await?;
 
     Ok(())
 }
