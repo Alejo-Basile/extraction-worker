@@ -1,7 +1,7 @@
 use crate::config::OcrConfig;
 use crate::consumer::OcrConsumer;
 use actix_web::{web, App, HttpResponse, HttpServer};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::PrometheusHandle;
 use std::env;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
@@ -14,6 +14,7 @@ pub mod consul_reg;
 pub mod consumer;
 pub mod kv;
 pub mod pipeline;
+pub mod telemetry;
 
 const SHUTDOWN_GRACE_SECS: u64 = 6;
 const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:8080";
@@ -37,12 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv_overlay = kv::load_overlay(&kv_settings).await;
     let cfg = OcrConfig::from_env_with_kv(kv_overlay);
     tracing::info!("ocr-worker iniciando con stream {}", cfg.redis_ocr_stream);
-    metrics::counter!("worker_ocr_started_total").increment(1);
 
-    // Prometheus metrics recorder
-    let _ = PrometheusBuilder::new()
-        .install_recorder()
-        .map_err(|e| format!("prometheus recorder error: {e}"));
+    // Prometheus metrics recorder: debe instalarse antes de emitir metricas;
+    // si no, los contadores se descartan y `/metrics` sirve un body vacio.
+    let prometheus = telemetry::prometheus_handle()?;
+    metrics::counter!("worker_ocr_started_total").increment(1);
 
     let metrics_addr =
         env::var("METRICS_ADDR").unwrap_or_else(|_| DEFAULT_METRICS_ADDR.to_string());
@@ -88,12 +88,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // HTTP server for health
-    let server = HttpServer::new(|| {
-        App::new().route(
-            "/healthz",
-            web::get().to(|| async { HttpResponse::Ok().body("ok") }),
-        )
+    // HTTP server for health and metrics
+    let prom_clone = prometheus.clone();
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(prom_clone.clone()))
+            .route(
+                "/healthz",
+                web::get().to(|| async { HttpResponse::Ok().body("ok") }),
+            )
+            .route("/metrics", web::get().to(metrics_handler))
     })
     .bind(&metrics_addr)?
     .shutdown_timeout(SHUTDOWN_GRACE_SECS)
@@ -137,6 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn metrics_handler(handle: web::Data<PrometheusHandle>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(handle.render())
+}
+
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     let sigterm = signal(SignalKind::terminate());
     async move {
@@ -151,5 +161,61 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             _ = sigterm.recv() => {},
             _ = tokio::signal::ctrl_c() => {},
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{test, App};
+
+    #[actix_web::test]
+    async fn metrics_route_exists() {
+        let handle = telemetry::prometheus_handle().unwrap_or_else(|e| panic!("{e}"));
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(handle))
+                .route("/metrics", web::get().to(metrics_handler)),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .unwrap_or_else(|| panic!("no ct"));
+        assert!(ct.to_str().unwrap_or("").starts_with("text/plain"));
+    }
+
+    #[actix_web::test]
+    async fn metrics_body_renders_metric() {
+        let handle = telemetry::prometheus_handle().unwrap_or_else(|e| panic!("{e}"));
+        metrics::counter!("worker_ocr_started_total").increment(1);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(handle))
+                .route("/metrics", web::get().to(metrics_handler)),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("worker_ocr_started_total"), "body: {text}");
+    }
+
+    #[actix_web::test]
+    async fn healthz_returns_ok() {
+        let app = test::init_service(App::new().route(
+            "/healthz",
+            web::get().to(|| async { HttpResponse::Ok().body("ok") }),
+        ))
+        .await;
+        let req = test::TestRequest::get().uri("/healthz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(body, "ok");
     }
 }
