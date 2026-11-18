@@ -1,0 +1,18 @@
+{
+  "_expected": {
+    "verdict": "rejected",
+    "key": "bulkhead_max_concurrency",
+    "reason": "range"
+  },
+  "bulkhead_max_concurrency": 0,
+  "retry_max_elapsed_seconds": 30,
+  "retry_initial_interval_ms": 500,
+  "retry_multiplier": 1.5,
+  "retry_max_interval_ms": 60000,
+  "retry_randomization_factor": 0.5,
+  "breaker_failure_threshold": 5,
+  "breaker_timeout_seconds": 30,
+  "job_timeout_seconds": 300,
+  "max_pages": 2000,
+  "min_idle_ms": 601000
+}
