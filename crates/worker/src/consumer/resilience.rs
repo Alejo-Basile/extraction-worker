@@ -17,8 +17,6 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::consumer::min_idle::MinIdleRestartState;
-
 /// Clasificacion de un fallo en el pipeline del consumer (S2-P3-02/07).
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
