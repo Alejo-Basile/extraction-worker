@@ -49,6 +49,13 @@ async fn main() -> std::io::Result<()> {
     }
     let port = http_port().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    // S1-P3-03: registrar SIGTERM/SIGINT ANTES de escuchar en HTTP. Si la
+    // senal llega entre `bind()` y la espera del apagado, el proceso muere
+    // con la disposicion por defecto (kill 15) sin drenar, que es justo lo
+    // que el DoD prohibe. Al crear los `Signal` aqui la notificacion queda
+    // retenida y el `.await` posterior la consume sin perderla.
+    let shutdown_signal = shutdown_signal();
+
     // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt/*.md)
     let cfg = ConsumerConfig::from_env();
     if extraction_worker::consumer::min_idle::coherence_violation(cfg.min_idle_ms, cfg.job_timeout)
@@ -220,7 +227,7 @@ async fn main() -> std::io::Result<()> {
         metrics_interval_secs = startup.2.as_secs()
     );
 
-    wait_for_shutdown_signal().await;
+    shutdown_signal.await;
     let started = Instant::now();
     // Cancelar loop de registro primero. Se acota la espera: un request de
     // registro en vuelo tiene timeout de 5 s y no debe consumir el presupuesto
@@ -278,23 +285,31 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// SIGTERM/SIGINT con drenaje: `stop(true)` cierra listeners y drena
+/// Espera SIGTERM/SIGINT con drenaje: `stop(true)` cierra listeners y drena
 /// las conexiones en vuelo hasta `shutdown_timeout`.
-async fn wait_for_shutdown_signal() {
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                service = telemetry::SERVICE,
-                msg = "no se pudo registrar SIGTERM; se sigue solo con SIGINT",
-                error = %e
-            );
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+///
+/// Debe invocarse antes de exponer el listener HTTP: construir los `Signal`
+/// registra el handler en el proceso, asi una senal que llegue antes del
+/// primer `.await` queda retenida y se consume, en vez de matar el proceso
+/// con la disposicion por defecto (exit 15, sin drenaje).
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let sigterm = signal(SignalKind::terminate());
+    async move {
+        let mut sigterm = match sigterm {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    service = telemetry::SERVICE,
+                    msg = "no se pudo registrar SIGTERM; se sigue solo con SIGINT",
+                    error = %e
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
         }
-    };
-    tokio::select! {
-        _ = sigterm.recv() => {},
-        _ = tokio::signal::ctrl_c() => {},
     }
 }
