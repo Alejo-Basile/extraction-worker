@@ -58,7 +58,7 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         s3_endpoint: std::env::var("S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string()),
         s3_bucket_raw: "raw-pdfs".to_string(),
-        s3_bucket_txt: "extracted-txt".to_string(),
+        s3_bucket_md: "extracted-md".to_string(),
         s3_access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "worker-dev".to_string()),
         s3_secret_key: std::env::var("S3_SECRET_KEY")
             .unwrap_or_else(|_| "worker-dev-secret".to_string()),

@@ -56,7 +56,7 @@ async fn main() -> std::io::Result<()> {
     // retenida y el `.await` posterior la consume sin perderla.
     let shutdown_signal = shutdown_signal();
 
-    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt/*.md)
+    // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-md/*.md)
     let cfg = ConsumerConfig::from_env();
     if extraction_worker::consumer::min_idle::coherence_violation(cfg.min_idle_ms, cfg.job_timeout)
     {
@@ -90,7 +90,7 @@ async fn main() -> std::io::Result<()> {
     let s3 = extraction_worker::objects::S3Config {
         endpoint: cfg.s3_endpoint.clone(),
         bucket_raw: cfg.s3_bucket_raw.clone(),
-        bucket_txt: cfg.s3_bucket_txt.clone(),
+        bucket_md: cfg.s3_bucket_md.clone(),
         access_key: cfg.s3_access_key.clone(),
         secret_key: cfg.s3_secret_key.clone(),
     };

@@ -24,7 +24,7 @@ clasificación `Document | Transient | Fatal | CircuitOpen` vive en
 
 | Causa | Transición Mongo | Objeto `.md` |
 |---|---|---|
-| Éxito | `PROCESSING -> COMPLETED` | queda en `extracted-txt` como `<document_id>.md` |
+| Éxito | `PROCESSING -> COMPLETED` | queda en `extracted-md` como `<document_id>.md` |
 | Error de documento / negocio | `PROCESSING -> REJECTED` | no se sube |
 | Reintentos de infraestructura agotados | `PROCESSING -> RETRYING`, luego `RETRYING -> EXTRACTION_FAILED` | se compensa al ir a DLQ |
 | `mark_terminal` inválido | no aplica | según estado |
@@ -79,5 +79,5 @@ clasificación `Document | Transient | Fatal | CircuitOpen` vive en
 - Para reemitir un caso que se quiere reprocesar usar `--replay-dlq`; antes
   ajusta el estado Mongo a un estado reclamable con
   `PROCESSING -> RETRYING` (actor `operator`).
-- No borrar objetos de `extracted-txt` a mano salvo con el flujo de
+- No borrar objetos de `extracted-md` a mano salvo con el flujo de
   compensación o el reconciliador.

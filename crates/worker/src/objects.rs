@@ -3,7 +3,7 @@
 //! - `ObjectStoreSource`: descarga `raw-pdfs/<document_id>.pdf` a un archivo
 //!   temporal en streaming, con limite duro de tamano (defensa en profundidad
 //!   sobre el limite de subida de 30 MB).
-//! - `ObjectStoreSink`: sube `extracted-txt/<document_id>.md` (put idempotente:
+//! - `ObjectStoreSink`: sube `extracted-md/<document_id>.md` (put idempotente:
 //!   repetir el paso deja un solo objeto).
 //!
 //! El `minio` de labs es path-style y http; en produccion el endpoint sera
@@ -26,7 +26,7 @@ pub const DEFAULT_S3_OP_TIMEOUT_MS: u64 = 60_000;
 pub struct S3Config {
     pub endpoint: String,
     pub bucket_raw: String,
-    pub bucket_txt: String,
+    pub bucket_md: String,
     pub access_key: String,
     pub secret_key: String,
 }
@@ -99,24 +99,24 @@ impl crate::consumer::pipeline::ObjectSource for ObjectStoreSource {
 }
 
 pub struct ObjectStoreSink {
-    txt: Arc<dyn ObjectStore>,
+    md: Arc<dyn ObjectStore>,
 }
 
 impl ObjectStoreSink {
     pub fn new(cfg: &S3Config) -> Result<Self, Failure> {
         Ok(Self {
-            txt: build_client(cfg, &cfg.bucket_txt)?,
+            md: build_client(cfg, &cfg.bucket_md)?,
         })
     }
 }
 
 impl crate::consumer::pipeline::TextSink for ObjectStoreSink {
     async fn put_text(&self, key: &str, text: &str) -> Result<(), Failure> {
-        put_text(&self.txt, key, text).await
+        put_text(&self.md, key, text).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), Failure> {
-        ObjectStoreExt::delete(self.txt.as_ref(), &StorePath::from(key))
+        ObjectStoreExt::delete(self.md.as_ref(), &StorePath::from(key))
             .await
             .map_err(|e| classify_object_store_error(&e))
     }
@@ -167,7 +167,7 @@ pub async fn download_to(
     Ok(total)
 }
 
-/// Sube el texto extraido (put idempotente sobre `extracted-txt`).
+/// Sube el texto extraido (put idempotente sobre `extracted-md`).
 pub async fn put_text(store: &Arc<dyn ObjectStore>, key: &str, text: &str) -> Result<(), Failure> {
     let path = StorePath::from(key);
     ObjectStoreExt::put(store.as_ref(), &path, text.to_string().into())

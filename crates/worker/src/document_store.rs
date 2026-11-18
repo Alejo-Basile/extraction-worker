@@ -6,7 +6,7 @@
 //! entrada en `status_history` (§11.1 reglas 2 y 3). Transiciones:
 //!
 //! - Reclamo: `QUEUED|RETRYING -> PROCESSING` al tomar el mensaje.
-//! - Cierre: `PROCESSING -> COMPLETED` con `txt_ref` y `completed_at`.
+//! - Cierre: `PROCESSING -> COMPLETED` con `md_ref` y `completed_at`.
 //!   Si el update no matchea (otro actor movio el estado), el worker lo
 //!   detecta y no pisa el estado ajeno.
 //!
@@ -107,14 +107,14 @@ impl DocumentStore {
         Ok(res.matched_count > 0)
     }
 
-    /// `PROCESSING -> COMPLETED` con `txt_ref` (paso 5, transicion condicional).
+    /// `PROCESSING -> COMPLETED` con `md_ref` (paso 5, transicion condicional).
     ///
     /// Devuelve `Ok(true)` si cerro, `Ok(false)` si el documento ya no estaba
     /// en `PROCESSING` (el estado de otro actor no se pisa).
     pub async fn complete(
         &self,
         document_id: &str,
-        txt_ref: &str,
+        md_ref: &str,
         correlation_id: &str,
         now_rfc3339: &str,
     ) -> Result<bool, Failure> {
@@ -126,7 +126,7 @@ impl DocumentStore {
         let update = doc! {
             "$set": {
                 "status": DocumentStatus::Completed.as_str(),
-                "txt_ref": txt_ref,
+                "md_ref": md_ref,
                 "completed_at": now_rfc3339,
                 "updated_at": now_rfc3339,
             },

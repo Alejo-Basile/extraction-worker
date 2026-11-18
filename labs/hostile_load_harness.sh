@@ -300,7 +300,7 @@ docker run -d --name "$WORKER_NAME" --network "$NETWORK" "${PORT_BIND[@]}" \
     -e MONGO_TIMEOUT_MS=3000 \
     -e S3_ENDPOINT=http://minio:9000 \
     -e S3_BUCKET_RAW=raw-pdfs \
-    -e S3_BUCKET_TXT=extracted-txt \
+    -e S3_BUCKET_MD=extracted-md \
     -e S3_ACCESS_KEY="$MINIO_ROOT_USER" \
     -e S3_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
     -e S3_OP_TIMEOUT_MS=60000 \

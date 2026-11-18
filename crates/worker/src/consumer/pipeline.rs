@@ -2,7 +2,7 @@
 //!
 //! Flujo por mensaje valido: GET `raw-pdfs/<object_key>` a un archivo temporal
 //! en streaming (con limite duro de tamano), extraccion CPU-bound en
-//! `spawn_blocking`, PUT `extracted-txt/<document_id>.md` (idempotente).
+//! `spawn_blocking`, PUT `extracted-md/<document_id>.md` (idempotente).
 //!
 //! Composicion de resiliencia por operacion S3: `Retry` envuelve al breaker
 //! de MinIO (instancia propia, S5-P3-01) y cada intento lleva su timeout.
@@ -83,9 +83,9 @@ fn entropy_suffix() -> u64 {
     h.hash_one(std::time::Instant::now())
 }
 
-/// Clave del texto extraido en `extracted-txt` (seccion 11.4).
+/// Clave del texto extraido en `extracted-md` (seccion 11.4).
 /// La extension es `.md`; el contenido sigue siendo texto plano.
-pub fn txt_key(document_id: &str) -> String {
+pub fn md_key(document_id: &str) -> String {
     format!("{document_id}.md")
 }
 
@@ -172,7 +172,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
                     ),
                 });
             }
-            let key = txt_key(&item.document_id);
+            let key = md_key(&item.document_id);
             self.upload(&key, &text).await
         };
         use std::sync::atomic::Ordering;
@@ -284,7 +284,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         );
         let started = std::time::Instant::now();
         let sink = self.sink.clone();
-        let key = txt_key(&item.document_id);
+        let key = md_key(&item.document_id);
         let op_timeout = self.s3_op_timeout;
         let result = with_retry_cb_cfg(&self.breaker, self.tunables.retry.as_ref(), || {
             let sink = sink.clone();
@@ -387,7 +387,7 @@ impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::Objec
         let s3 = crate::objects::S3Config {
             endpoint: cfg.s3_endpoint.clone(),
             bucket_raw: cfg.s3_bucket_raw.clone(),
-            bucket_txt: cfg.s3_bucket_txt.clone(),
+            bucket_md: cfg.s3_bucket_md.clone(),
             access_key: cfg.s3_access_key.clone(),
             secret_key: cfg.s3_secret_key.clone(),
         };
@@ -470,7 +470,7 @@ mod tests {
         let files = sink_of(&p);
         let files = files.lock().unwrap_or_else(|e| e.into_inner());
         let text = files
-            .get(&txt_key("01J9Z8QK3M7X2V0N4P6R8T1Y0B"))
+            .get(&md_key("01J9Z8QK3M7X2V0N4P6R8T1Y0B"))
             .unwrap_or_else(|| panic!("falta el .md en el sink"));
         assert_eq!(text, "hola mundo");
     }

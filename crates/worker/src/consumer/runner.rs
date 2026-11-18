@@ -5,7 +5,7 @@
 //! 2. Delivery count de `XPENDING` > `WORKER_MAX_ATTEMPTS` -> DLQ
 //!    `MAX_ATTEMPTS_EXCEEDED` (transient), sin re-extraer.
 //! 3. Pipeline: GET raw-pdfs -> archivo temporal -> extraccion -> PUT
-//!    de la salida `.md` en `extracted-txt`. Exito -> `XACK`.
+//!    de la salida `.md` en `extracted-md`. Exito -> `XACK`.
 //!    `Failure::Document` -> DLQ (business).
 //!    Transient/Fatal/CircuitOpen -> el mensaje queda pendiente (se reclama
 //!    con `XAUTOCLAIM` y repite).
@@ -1245,19 +1245,19 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let documents = ctx.documents.clone();
         let document_id = item.document_id.clone();
         let correlation_id = item.correlation_id.clone();
-        let txt_ref = super::pipeline::txt_key(&item.document_id);
+        let md_ref = super::pipeline::md_key(&item.document_id);
         let now = now_rfc3339();
         let mongo_timeout = ctx.cfg.mongo_timeout;
         with_retry_cb_cfg(&ctx.mongo_breaker, ctx.tunables.retry.as_ref(), || {
             let documents = documents.clone();
             let document_id = document_id.clone();
             let correlation_id = correlation_id.clone();
-            let txt_ref = txt_ref.clone();
+            let md_ref = md_ref.clone();
             let now = now.clone();
             async move {
                 match timeout(
                     mongo_timeout,
-                    documents.complete(&document_id, &txt_ref, &correlation_id, &now),
+                    documents.complete(&document_id, &md_ref, &correlation_id, &now),
                 )
                 .await
                 {

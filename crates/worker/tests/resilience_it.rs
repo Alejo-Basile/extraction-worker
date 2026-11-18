@@ -51,7 +51,7 @@ async fn breaker_abierto_no_abre_conexiones_de_red() {
     let source = Arc::new(must(ObjectStoreSource::new(&S3Config {
         endpoint: format!("http://{addr}"),
         bucket_raw: "raw-pdfs".to_string(),
-        bucket_txt: "extracted-txt".to_string(),
+        bucket_md: "extracted-md".to_string(),
         access_key: "test".to_string(),
         secret_key: "test-secret".to_string(),
     })));

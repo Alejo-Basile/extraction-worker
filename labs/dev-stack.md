@@ -17,11 +17,11 @@ Servicios:
 | Servicio | Puerto | Uso en F3a | Uso en F3b |
 |---|---|---|---|
 | `redis` | 6379 | streams del consumer (tests `#[ignore]`) | idem |
-| `minio` | 9000 (API), 9001 (consola) | `raw-pdfs` (GET) y `extracted-txt` (PUT, claves `.md`) | idem |
+| `minio` | 9000 (API), 9001 (consola) | `raw-pdfs` (GET) y `extracted-md` (PUT, claves `.md`) | idem |
 | `mongo` (rs0) | 27017 | preparado, sin uso | transicion condicional `PROCESSING -> COMPLETED` (S2-P3-08) |
 
 `minio-init` y `mongo-init` son one-shot: crean buckets (`raw-pdfs`,
-`extracted-txt`, anonimo deshabilitado) e inician el Replica Set.
+`extracted-md`, anonimo deshabilitado) e inician el Replica Set.
 
 ## Variables que consume el worker
 
@@ -29,7 +29,7 @@ Servicios:
 export S3_ENDPOINT=http://127.0.0.1:9000
 export S3_ACCESS_KEY=worker-dev
 export S3_SECRET_KEY=worker-dev-secret
-# buckets con default: raw-pdfs / extracted-txt (S3_BUCKET_RAW, S3_BUCKET_TXT)
+# buckets con default: raw-pdfs / extracted-md (S3_BUCKET_RAW, S3_BUCKET_MD)
 ```
 
 ## Probar

@@ -18,7 +18,7 @@ fn s3_config() -> objects::S3Config {
         endpoint: std::env::var("S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string()),
         bucket_raw: "raw-pdfs".to_string(),
-        bucket_txt: "extracted-txt".to_string(),
+        bucket_md: "extracted-md".to_string(),
         access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "worker-dev".to_string()),
         secret_key: std::env::var("S3_SECRET_KEY")
             .unwrap_or_else(|_| "worker-dev-secret".to_string()),
@@ -62,7 +62,7 @@ async fn get_txt_store() -> Arc<dyn object_store::ObjectStore> {
     let s3 = s3_config();
     let store = AmazonS3Builder::new()
         .with_endpoint(&s3.endpoint)
-        .with_bucket_name(&s3.bucket_txt)
+        .with_bucket_name(&s3.bucket_md)
         .with_access_key_id(&s3.access_key)
         .with_secret_access_key(&s3.secret_key)
         .with_allow_http(true)
@@ -88,7 +88,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
     let txt = get_txt_store().await;
     let id = format!("it-f3a-{}-{}", std::process::id(), now_millis());
     let raw_key = format!("raw-pdfs/{id}.pdf");
-    let txt_key = format!("{id}.md");
+    let md_key = format!("{id}.md");
 
     // 1. Subir el PDF de prueba a raw-pdfs (como lo haria el cliente via URL
     // prefirmada).
@@ -106,7 +106,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
     let cfg = ConsumerConfig {
         s3_endpoint: s3_config().endpoint,
         s3_bucket_raw: "raw-pdfs".to_string(),
-        s3_bucket_txt: "extracted-txt".to_string(),
+        s3_bucket_md: "extracted-md".to_string(),
         s3_access_key: s3_config().access_key,
         s3_secret_key: s3_config().secret_key,
         redis_url: String::new(),
@@ -156,8 +156,8 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         .await
         .unwrap_or_else(|e| panic!("pipeline debe triunfar: {e}"));
 
-    // 4. El .md esta en extracted-txt con texto del fixture.
-    let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(txt_key.clone())).await);
+    // 4. El .md esta en extracted-md con texto del fixture.
+    let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(md_key.clone())).await);
     let bytes = must(got.bytes().await);
     let first_text = String::from_utf8_lossy(&bytes).to_string();
     assert!(
@@ -172,7 +172,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         .await
         .unwrap_or_else(|e| panic!("reproceso idempotente debe triunfar: {e}"));
 
-    let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(txt_key.clone())).await);
+    let got = must(ObjectStoreExt::get(txt.as_ref(), &StorePath::from(md_key.clone())).await);
     let bytes = must(got.bytes().await);
     let second_text = String::from_utf8_lossy(&bytes).to_string();
     assert_eq!(
@@ -180,7 +180,7 @@ async fn pipeline_extrae_pdf_de_minio_y_publica_txt() {
         "la segunda extraccion debe producir el mismo objeto"
     );
 
-    cleanup(&[raw, txt.clone()], &[&raw_key, &txt_key]).await;
+    cleanup(&[raw, txt.clone()], &[&raw_key, &md_key]).await;
 }
 
 #[tokio::test]

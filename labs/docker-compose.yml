@@ -22,7 +22,9 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       # Buckets del pipeline (seccion 11.4); MinIO los crea privados.
-      MINIO_DEFAULT_BUCKETS: raw-pdfs,extracted-txt
+      # extracted-md es la salida vigente; extracted-txt queda para objetos .txt
+      # legacy (fallback de lectura de doc-service).
+      MINIO_DEFAULT_BUCKETS: raw-pdfs,extracted-md,extracted-txt
     volumes:
       - minio-data:/bitnami/minio/data
     healthcheck:
