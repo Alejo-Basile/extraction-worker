@@ -1,1 +1,8 @@
-{"a":1,}
+{
+  "_expected": {
+    "verdict": "rejected",
+    "key": null,
+    "reason": "malformed_json"
+  },
+  "bulkhead_max_concurrency": 4,
+  "job_timeout_seconds": 300,
