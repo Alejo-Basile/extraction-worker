@@ -1,0 +1,19 @@
+{
+  "_expected": {
+    "verdict": "rejected",
+    "key": "ocr_dpi",
+    "reason": "range"
+  },
+  "ocr_dpi": 1000,
+  "ocr_limit_w": 3500,
+  "ocr_limit_pix": 12000000,
+  "ocr_lang": "spa+eng",
+  "ocr_oem": 1,
+  "ocr_psm": 3,
+  "ocr_max_attempts": 3,
+  "consumer_block_ms": 5000,
+  "consumer_count": 1,
+  "redis_ocr_stream": "stream:ocr-processing",
+  "redis_ocr_group": "ocr-workers",
+  "redis_ocr_dlq_stream": "stream:ocr-processing-dlq"
+}

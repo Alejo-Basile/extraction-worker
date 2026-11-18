@@ -42,6 +42,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 COPY --from=builder /src/ocr-worker /usr/local/bin/ocr-worker
 
+# S11-P1-C30: last-known-good CONFIG CACHE DIRECTORY.
+# The compose service mounts `ocr-worker-config-cache` here and the rootfs is
+# read_only, so the directory must exist with the runtime user as owner: an
+# empty named volume inherits the image directory's ownership on first use.
+RUN mkdir -p /var/lib/ocr-worker && chown 10001:10001 /var/lib/ocr-worker
+
 EXPOSE 8080
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=15s \

@@ -2,6 +2,7 @@
 pub enum ValueKind {
     Int,
     Float,
+    String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +126,123 @@ pub fn reload_mode(key: &str) -> Option<ReloadMode> {
     spec(key).map(|s| s.reload)
 }
 
+// ---------------------------------------------------------------------------
+// S11-P1-C30: ocr-worker contract. Every key is `restart` because
+// `OcrConfig` is built once at process start (ADR-0022).
+// For `ValueKind::String`, `min`/`max` are accepted value lengths.
+// ---------------------------------------------------------------------------
+static OCR_SPECS: [KeySpec; 12] = [
+    KeySpec {
+        key: "ocr_dpi",
+        kind: ValueKind::Int,
+        min: Some(72.0),
+        max: Some(600.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_limit_w",
+        kind: ValueKind::Int,
+        min: Some(100.0),
+        max: Some(10000.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_limit_pix",
+        kind: ValueKind::Int,
+        min: Some(1000000.0),
+        max: Some(100000000.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_lang",
+        kind: ValueKind::String,
+        min: Some(1.0),
+        max: Some(255.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_oem",
+        kind: ValueKind::Int,
+        min: Some(0.0),
+        max: Some(3.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_psm",
+        kind: ValueKind::Int,
+        min: Some(0.0),
+        max: Some(13.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "ocr_max_attempts",
+        kind: ValueKind::Int,
+        min: Some(1.0),
+        max: Some(10.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "consumer_block_ms",
+        kind: ValueKind::Int,
+        min: Some(100.0),
+        max: Some(60000.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "consumer_count",
+        kind: ValueKind::Int,
+        min: Some(1.0),
+        max: Some(16.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "redis_ocr_stream",
+        kind: ValueKind::String,
+        min: Some(1.0),
+        max: Some(255.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "redis_ocr_group",
+        kind: ValueKind::String,
+        min: Some(1.0),
+        max: Some(255.0),
+        reload: ReloadMode::Restart,
+    },
+    KeySpec {
+        key: "redis_ocr_dlq_stream",
+        kind: ValueKind::String,
+        min: Some(1.0),
+        max: Some(255.0),
+        reload: ReloadMode::Restart,
+    },
+];
+
+static OCR_KEY_NAMES: [&str; 12] = [
+    "ocr_dpi",
+    "ocr_limit_w",
+    "ocr_limit_pix",
+    "ocr_lang",
+    "ocr_oem",
+    "ocr_psm",
+    "ocr_max_attempts",
+    "consumer_block_ms",
+    "consumer_count",
+    "redis_ocr_stream",
+    "redis_ocr_group",
+    "redis_ocr_dlq_stream",
+];
+
+pub fn ocr_spec(key: &str) -> Option<&'static KeySpec> {
+    OCR_SPECS.iter().find(|s| s.key == key)
+}
+pub fn ocr_keys() -> &'static [&'static str] {
+    &OCR_KEY_NAMES
+}
+pub fn ocr_reload_mode(key: &str) -> Option<ReloadMode> {
+    ocr_spec(key).map(|s| s.reload)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -144,5 +262,17 @@ mod tests {
             reload_mode("bulkhead_max_concurrency"),
             Some(ReloadMode::HotAumento)
         );
+    }
+
+    #[test]
+    fn ocr_keys_are_all_restart() {
+        assert_eq!(ocr_keys().len(), 12);
+        for k in ocr_keys() {
+            assert!(ocr_spec(k).is_some(), "missing ocr spec for {k}");
+            assert_eq!(ocr_reload_mode(k), Some(ReloadMode::Restart));
+        }
+        assert!(ocr_spec("ocr_lang")
+            .map(|s| s.kind == ValueKind::String)
+            .unwrap_or(false));
     }
 }

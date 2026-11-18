@@ -35,6 +35,46 @@ impl Default for ValidatedWorkerKv {
     }
 }
 
+/// S11-P1-C30: validated view of `config/ocr-worker/`.
+///
+/// Every key is restart-only (ADR-0022): the OCR worker reads its configuration
+/// once at start, so a KV change is observed and logged but never applied to a
+/// running process.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedOcrWorkerKv {
+    pub ocr_dpi: u32,
+    pub ocr_limit_w: u32,
+    pub ocr_limit_pix: u64,
+    pub ocr_lang: String,
+    pub ocr_oem: u8,
+    pub ocr_psm: u8,
+    pub ocr_max_attempts: u32,
+    pub consumer_block_ms: u64,
+    pub consumer_count: usize,
+    pub redis_ocr_stream: String,
+    pub redis_ocr_group: String,
+    pub redis_ocr_dlq_stream: String,
+}
+
+impl Default for ValidatedOcrWorkerKv {
+    fn default() -> Self {
+        Self {
+            ocr_dpi: 150,
+            ocr_limit_w: 3500,
+            ocr_limit_pix: 12_000_000,
+            ocr_lang: "spa+eng".to_string(),
+            ocr_oem: 1,
+            ocr_psm: 3,
+            ocr_max_attempts: 3,
+            consumer_block_ms: 5000,
+            consumer_count: 1,
+            redis_ocr_stream: "stream:ocr-processing".to_string(),
+            redis_ocr_group: "ocr-workers".to_string(),
+            redis_ocr_dlq_stream: "stream:ocr-processing-dlq".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
     MalformedJson,
@@ -175,6 +215,14 @@ pub fn validate_values(
                         _ => {}
                     }
                 }
+                ValueKind::String => {
+                    // The extraction-worker contract declares no string keys.
+                    // Reject instead of silently ignoring an unexpected shape.
+                    return Err(Rejection {
+                        key: Some(key.to_string()),
+                        reason: RejectReason::Type,
+                    });
+                }
             }
         }
     }
@@ -189,7 +237,13 @@ pub fn validate_values(
 }
 
 pub fn from_consul_entries(entries: &[KvEntry]) -> Result<ValidatedWorkerKv, Rejection> {
-    // base64-decode each Value, parse as JSON scalar, build map
+    let map = decode_entries(entries)?;
+    validate_values(&map)
+}
+
+/// Shared decoder: base64-decode every Consul value and rebuild the flat map by
+/// the last path segment (the key name).
+fn decode_entries(entries: &[KvEntry]) -> Result<serde_json::Map<String, Value>, Rejection> {
     let mut map = serde_json::Map::new();
     for e in entries {
         // key is full path; strip prefix? Use last segment
@@ -204,7 +258,168 @@ pub fn from_consul_entries(entries: &[KvEntry]) -> Result<ValidatedWorkerKv, Rej
         })?;
         map.insert(short.to_string(), v);
     }
-    validate_values(&map)
+    Ok(map)
+}
+
+/// S11-P1-C30: parse and validate a raw JSON document against the ocr-worker
+/// contract. Partial documents are accepted; absent keys keep their default.
+pub fn validate_ocr_str(raw: &str) -> Result<ValidatedOcrWorkerKv, Rejection> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| Rejection {
+        key: None,
+        reason: RejectReason::MalformedJson,
+    })?;
+    let obj = v.as_object().ok_or(Rejection {
+        key: None,
+        reason: RejectReason::MalformedJson,
+    })?;
+    validate_ocr_values(obj)
+}
+
+pub fn validate_ocr_values(
+    map: &serde_json::Map<String, Value>,
+) -> Result<ValidatedOcrWorkerKv, Rejection> {
+    let mut out = ValidatedOcrWorkerKv::default();
+    for k in map.keys() {
+        if schema::ocr_spec(k).is_none() {
+            return Err(Rejection {
+                key: Some(k.clone()),
+                reason: RejectReason::UnknownKey,
+            });
+        }
+    }
+    for key in schema::ocr_keys() {
+        let v = match map.get(*key) {
+            Some(v) => v,
+            None => continue,
+        };
+        let sp = match schema::ocr_spec(key) {
+            Some(s) => s,
+            None => {
+                return Err(Rejection {
+                    key: Some(key.to_string()),
+                    reason: RejectReason::UnknownKey,
+                })
+            }
+        };
+        match sp.kind {
+            ValueKind::Int => {
+                let n = v.as_i64().or_else(|| v.as_u64().map(|x| x as i64));
+                let is_integral =
+                    v.is_number() && v.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false);
+                if !is_integral {
+                    return Err(Rejection {
+                        key: Some(key.to_string()),
+                        reason: RejectReason::Type,
+                    });
+                }
+                let val = match n {
+                    Some(x) if x >= 0 => x,
+                    _ => {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Type,
+                        })
+                    }
+                };
+                let f = val as f64;
+                if let Some(mn) = sp.min {
+                    if f < mn {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Range,
+                        });
+                    }
+                }
+                if let Some(mx) = sp.max {
+                    if f > mx {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Range,
+                        });
+                    }
+                }
+                match *key {
+                    "ocr_dpi" => out.ocr_dpi = val as u32,
+                    "ocr_limit_w" => out.ocr_limit_w = val as u32,
+                    "ocr_limit_pix" => out.ocr_limit_pix = val as u64,
+                    "ocr_oem" => out.ocr_oem = val as u8,
+                    "ocr_psm" => out.ocr_psm = val as u8,
+                    "ocr_max_attempts" => out.ocr_max_attempts = val as u32,
+                    "consumer_block_ms" => out.consumer_block_ms = val as u64,
+                    "consumer_count" => out.consumer_count = val as usize,
+                    _ => {}
+                }
+            }
+            ValueKind::String => {
+                let s = match v.as_str() {
+                    Some(s) => s,
+                    None => {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Type,
+                        })
+                    }
+                };
+                // For string keys, min/max are accepted lengths.
+                let len = s.chars().count() as f64;
+                if let Some(mn) = sp.min {
+                    if len < mn {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Range,
+                        });
+                    }
+                }
+                if let Some(mx) = sp.max {
+                    if len > mx {
+                        return Err(Rejection {
+                            key: Some(key.to_string()),
+                            reason: RejectReason::Range,
+                        });
+                    }
+                }
+                match *key {
+                    "ocr_lang" => out.ocr_lang = s.to_string(),
+                    "redis_ocr_stream" => out.redis_ocr_stream = s.to_string(),
+                    "redis_ocr_group" => out.redis_ocr_group = s.to_string(),
+                    "redis_ocr_dlq_stream" => out.redis_ocr_dlq_stream = s.to_string(),
+                    _ => {}
+                }
+            }
+            ValueKind::Float => {
+                return Err(Rejection {
+                    key: Some(key.to_string()),
+                    reason: RejectReason::Type,
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// S11-P1-C30: build the ocr-worker view from Consul entries.
+///
+/// KV values are raw strings (the sync script writes them verbatim), so a
+/// string-typed key is used as-is and every other key is parsed as a JSON
+/// scalar. Parsing everything as JSON first would reject legitimate values such
+/// as `spa+eng` as `malformed_json`.
+pub fn from_consul_entries_ocr(entries: &[KvEntry]) -> Result<ValidatedOcrWorkerKv, Rejection> {
+    let mut map = serde_json::Map::new();
+    for e in entries {
+        let short = e.key.rsplit('/').next().unwrap_or(&e.key);
+        let decoded = e.decode_value().map_err(|_| Rejection {
+            key: Some(short.to_string()),
+            reason: RejectReason::MalformedJson,
+        })?;
+        let kind = schema::ocr_spec(short).map(|s| s.kind);
+        let value = if kind == Some(ValueKind::String) {
+            Value::String(decoded)
+        } else {
+            serde_json::from_str(&decoded).unwrap_or(Value::String(decoded))
+        };
+        map.insert(short.to_string(), value);
+    }
+    validate_ocr_values(&map)
 }
 
 #[cfg(test)]
@@ -259,6 +474,38 @@ mod tests {
         assert_eq!(r.key, None);
         assert_eq!(r.reason, RejectReason::MalformedJson);
     }
+    #[test]
+    fn ocr_entries_keep_raw_string_values() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let entries = vec![
+            KvEntry {
+                key: "config/ocr-worker/ocr_lang".into(),
+                value: b64("spa+eng"),
+            },
+            KvEntry {
+                key: "config/ocr-worker/ocr_dpi".into(),
+                value: b64("300"),
+            },
+        ];
+        let v = from_consul_entries_ocr(&entries).expect("raw KV values must validate");
+        assert_eq!(v.ocr_lang, "spa+eng");
+        assert_eq!(v.ocr_dpi, 300);
+    }
+
+    #[test]
+    fn ocr_entries_reject_out_of_range_raw_int() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let entries = vec![KvEntry {
+            key: "config/ocr-worker/ocr_dpi".into(),
+            value: b64("1000"),
+        }];
+        let r = from_consul_entries_ocr(&entries).unwrap_err();
+        assert_eq!(r.key.as_deref(), Some("ocr_dpi"));
+        assert_eq!(r.reason, RejectReason::Range);
+    }
+
     #[test]
     fn happy_path() {
         // Vendored copy of the C10 contract fixture: this repository must build

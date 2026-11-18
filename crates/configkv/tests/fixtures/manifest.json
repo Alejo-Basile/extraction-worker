@@ -108,6 +108,36 @@
       "verdict": "rejected",
       "key": "exempt_paths",
       "reason": "type"
+    },
+    {
+      "file": "ocr-worker.valid.json",
+      "verdict": "accepted",
+      "key": null,
+      "reason": null
+    },
+    {
+      "file": "ocr-worker.out-of-range.json",
+      "verdict": "rejected",
+      "key": "ocr_dpi",
+      "reason": "range"
+    },
+    {
+      "file": "ocr-worker.wrong-type.json",
+      "verdict": "rejected",
+      "key": "ocr_lang",
+      "reason": "type"
+    },
+    {
+      "file": "ocr-worker.unknown-key.json",
+      "verdict": "rejected",
+      "key": "ocr_unknown_flag",
+      "reason": "unknown_key"
+    },
+    {
+      "file": "ocr-worker.malformed.json",
+      "verdict": "rejected",
+      "key": null,
+      "reason": "malformed_json"
     }
   ]
 }

@@ -23,6 +23,29 @@ pub struct OcrConfig {
 }
 
 impl OcrConfig {
+    /// S11-P1-C30: env defaults, optionally overridden by a validated
+    /// `config/ocr-worker/` overlay. Endpoints and credentials stay env-only:
+    /// they never live in KV.
+    pub fn from_env_with_kv(overlay: Option<configkv::ValidatedOcrWorkerKv>) -> Self {
+        let mut cfg = Self::from_env();
+        if let Some(v) = overlay {
+            cfg.ocr_dpi = v.ocr_dpi;
+            cfg.ocr_limit_w = v.ocr_limit_w;
+            cfg.ocr_limit_pix = v.ocr_limit_pix;
+            cfg.ocr_lang = v.ocr_lang;
+            cfg.ocr_oem = v.ocr_oem;
+            cfg.ocr_psm = v.ocr_psm;
+            cfg.ocr_max_attempts = v.ocr_max_attempts;
+            cfg.consumer_block_ms = v.consumer_block_ms;
+            cfg.consumer_count = v.consumer_count;
+            cfg.redis_ocr_stream = v.redis_ocr_stream;
+            cfg.redis_ocr_group = v.redis_ocr_group;
+            cfg.redis_ocr_dlq_stream = v.redis_ocr_dlq_stream;
+            tracing::info!("ocr_config_kv_overlay_applied");
+        }
+        cfg
+    }
+
     pub fn from_env() -> Self {
         Self {
             redis_url: std::env::var("REDIS_URL")
