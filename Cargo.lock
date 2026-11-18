@@ -2296,6 +2296,7 @@ name = "ocr-worker"
 version = "0.0.0"
 dependencies = [
  "actix-web",
+ "configkv",
  "extraction-core",
  "hostname",
  "metrics",

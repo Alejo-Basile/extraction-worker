@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 pub mod config;
 pub mod consul_reg;
 pub mod consumer;
+pub mod kv;
 pub mod pipeline;
 
 const SHUTDOWN_GRACE_SECS: u64 = 6;
@@ -31,7 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cfg = OcrConfig::from_env();
+    // S11-P1-C30: Consul KV overlay first (max 2 s), then env defaults.
+    let kv_settings = kv::settings_from_env();
+    let kv_overlay = kv::load_overlay(&kv_settings).await;
+    let cfg = OcrConfig::from_env_with_kv(kv_overlay);
     tracing::info!("ocr-worker iniciando con stream {}", cfg.redis_ocr_stream);
     metrics::counter!("worker_ocr_started_total").increment(1);
 
@@ -52,6 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let consumer_handle = tokio::spawn(async move {
         if let Err(e) = consumer.run().await {
             tracing::error!("consumer error: {}", e);
+        }
+    });
+
+    // S11-P1-C30: every KV key is restart-only; observe changes, never apply.
+    let kv_cancel = CancellationToken::new();
+    tokio::spawn({
+        let settings = kv_settings.clone();
+        let cancel = kv_cancel.clone();
+        async move {
+            kv::watch_restart_required(settings, cancel).await;
         }
     });
 
@@ -92,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_signal.await;
     let started = Instant::now();
     reg_cancel.cancel();
+    kv_cancel.cancel();
     if tokio::time::timeout(Duration::from_millis(300), &mut reg_task)
         .await
         .is_err()

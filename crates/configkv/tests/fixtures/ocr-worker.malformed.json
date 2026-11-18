@@ -1,0 +1,8 @@
+{
+  "_expected": {
+    "verdict": "rejected",
+    "key": null,
+    "reason": "malformed_json"
+  },
+  "ocr_dpi": 150,
+  "ocr_lang": "spa+eng"

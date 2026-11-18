@@ -7,7 +7,9 @@
 //! upstream directory is present (local monorepo layout), `vendored_matches_upstream`
 //! keeps the copies honest. Any contract change must be re-synced from upstream.
 
-use configkv::{validate_str, validate_values, RejectReason};
+use configkv::{
+    validate_ocr_str, validate_ocr_values, validate_str, validate_values, RejectReason,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +33,16 @@ fn worker_entries(manifest: &Value) -> Vec<Value> {
                 .unwrap_or("")
                 .starts_with("extraction-worker.")
         })
+        .collect()
+}
+
+fn ocr_entries(manifest: &Value) -> Vec<Value> {
+    manifest["fixtures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e["file"].as_str().unwrap_or("").starts_with("ocr-worker."))
         .collect()
 }
 
@@ -71,6 +83,60 @@ fn parity() {
         let file = e["file"].as_str().unwrap();
         let raw = std::fs::read_to_string(base.join(file)).unwrap();
         let (verdict, key, reason) = verdict_of(&raw);
+        println!(
+            "{} -> {}/{}",
+            file,
+            verdict,
+            key.clone().unwrap_or_default()
+        );
+
+        assert_eq!(
+            verdict,
+            e["verdict"].as_str().unwrap(),
+            "verdict for {file}"
+        );
+        let expected_key = e.get("key").and_then(|x| x.as_str());
+        assert_eq!(key.as_deref(), expected_key, "key for {file}");
+        let expected_reason = e.get("reason").and_then(|x| x.as_str());
+        assert_eq!(reason.as_deref(), expected_reason, "reason for {file}");
+    }
+}
+
+fn ocr_verdict_of(raw: &str) -> (&'static str, Option<String>, Option<String>) {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("_expected");
+            }
+            let map = v.as_object().cloned().unwrap_or_default();
+            match validate_ocr_values(&map) {
+                Ok(_) => ("accepted", None, None),
+                Err(r) => ("rejected", r.key, Some(r.reason.as_str().to_string())),
+            }
+        }
+        Err(_) => match validate_ocr_str(raw) {
+            Ok(_) => ("accepted", None, None),
+            Err(r) => ("rejected", r.key, Some(r.reason.as_str().to_string())),
+        },
+    }
+}
+
+/// S11-P1-C30: the ocr-worker contract shares the same oracle and the same
+/// verdict vocabulary as the other KV clients.
+#[test]
+fn ocr_parity() {
+    let base = vendored_dir();
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("manifest.json")).unwrap())
+            .unwrap();
+
+    let entries = ocr_entries(&manifest);
+    assert_eq!(entries.len(), 5, "oracle must expose the five ocr fixtures");
+
+    for e in entries {
+        let file = e["file"].as_str().unwrap();
+        let raw = std::fs::read_to_string(base.join(file)).unwrap();
+        let (verdict, key, reason) = ocr_verdict_of(&raw);
         println!(
             "{} -> {}/{}",
             file,
