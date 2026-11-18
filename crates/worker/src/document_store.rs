@@ -251,6 +251,12 @@ pub fn mongo_breaker() -> Arc<CircuitBreaker> {
     DocumentStore::breaker()
 }
 
+pub fn mongo_breaker_with(
+    config: std::sync::Arc<crate::consumer::resilience::BreakerConfig>,
+) -> Arc<CircuitBreaker> {
+    Arc::new(CircuitBreaker::with_config(config))
+}
+
 fn mongo_failure(e: mongodb::error::Error) -> Failure {
     // Auth/config falla siempre; el resto (red, selection timeout) es
     // reintentable y deja el mensaje pendiente.

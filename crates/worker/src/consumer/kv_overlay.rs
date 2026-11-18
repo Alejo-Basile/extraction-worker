@@ -46,6 +46,32 @@ impl WorkerKvOverlay {
         }
         // retry/breaker fields consumed by C19 (no fields on ConsumerConfig yet)
     }
+    pub fn apply_tunables(&self, t: &crate::consumer::resilience::WorkerTunables) {
+        use std::sync::atomic::Ordering;
+        if let Some(v) = self.breaker_failure_threshold {
+            t.breaker
+                .failure_threshold
+                .store(v as usize, Ordering::Relaxed);
+        }
+        if let Some(v) = self.breaker_timeout_seconds {
+            t.breaker.timeout_ms.store(v * 1000, Ordering::Relaxed);
+        }
+        if let Some(v) = self.retry_max_elapsed_seconds {
+            t.retry.max_elapsed_seconds.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = self.retry_initial_interval_ms {
+            t.retry.initial_interval_ms.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = self.retry_max_interval_ms {
+            t.retry.max_interval_ms.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = self.retry_multiplier {
+            t.retry.multiplier.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = self.retry_randomization_factor {
+            t.retry.randomization_factor.store(v, Ordering::Relaxed);
+        }
+    }
     // accessors for C19
     pub fn retry_max_elapsed_seconds(&self) -> Option<u64> {
         self.retry_max_elapsed_seconds
@@ -86,6 +112,57 @@ mod tests {
         assert_eq!(cfg.max_pages, 2000);
         assert_eq!(cfg.min_idle_ms, 601000);
     }
+    #[test]
+    fn apply_tunables_aplica_solo_campos_presentes() {
+        let _g = LOCK.lock().unwrap();
+        let t = crate::consumer::resilience::WorkerTunables::new();
+        let ov = WorkerKvOverlay {
+            bulkhead_max_concurrency: None,
+            retry_max_elapsed_seconds: Some(10),
+            retry_initial_interval_ms: None,
+            retry_multiplier: None,
+            retry_max_interval_ms: None,
+            retry_randomization_factor: None,
+            breaker_failure_threshold: Some(1),
+            breaker_timeout_seconds: None,
+            job_timeout_seconds: None,
+            max_pages: None,
+            min_idle_ms: None,
+        };
+        ov.apply_tunables(&t);
+        use std::sync::atomic::Ordering;
+        assert_eq!(t.breaker.failure_threshold.load(Ordering::Relaxed), 1);
+        assert_eq!(t.retry.max_elapsed_seconds.load(Ordering::Relaxed), 10);
+        assert_eq!(t.breaker.timeout_ms.load(Ordering::Relaxed), 30_000);
+        assert_eq!(t.retry.initial_interval_ms.load(Ordering::Relaxed), 500);
+    }
+
+    #[test]
+    fn apply_tunables_umbral_compartido_abre_breakers_existentes() {
+        let _g = LOCK.lock().unwrap();
+        let t = crate::consumer::resilience::WorkerTunables::new();
+        let cb1 = crate::consumer::resilience::CircuitBreaker::with_config(t.breaker.clone());
+        let cb2 = crate::consumer::resilience::CircuitBreaker::with_config(t.breaker.clone());
+        let ov = WorkerKvOverlay {
+            bulkhead_max_concurrency: None,
+            retry_max_elapsed_seconds: None,
+            retry_initial_interval_ms: None,
+            retry_multiplier: None,
+            retry_max_interval_ms: None,
+            retry_randomization_factor: None,
+            breaker_failure_threshold: Some(1),
+            breaker_timeout_seconds: None,
+            job_timeout_seconds: None,
+            max_pages: None,
+            min_idle_ms: None,
+        };
+        ov.apply_tunables(&t);
+        cb1.on_failure();
+        cb2.on_failure();
+        assert!(cb1.is_open());
+        assert!(cb2.is_open());
+    }
+
     #[test]
     fn only_max_pages_changes() {
         let _g = LOCK.lock().unwrap();

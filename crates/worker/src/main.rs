@@ -56,7 +56,12 @@ async fn main() -> std::io::Result<()> {
         cfg.consumer_name.clone(),
         cfg.metrics_interval,
     );
-    let pipeline = extraction_worker::consumer::pipeline::ExtractionPipeline::from_env(&cfg)
+    let tunables = extraction_worker::consumer::resilience::WorkerTunables::new();
+    let pipeline =
+        extraction_worker::consumer::pipeline::ExtractionPipeline::from_env_with_tunables(
+            &cfg,
+            tunables.clone(),
+        )
         .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
     // F3b: cliente Mongo con rol acotado (ADR-0006); sin MONGO_WORKER_URI
     // valido el worker no arranca.
@@ -77,10 +82,11 @@ async fn main() -> std::io::Result<()> {
     let readiness = std::sync::Arc::new(
         http::Readiness::new(&cfg, minio, documents.clone()).map_err(std::io::Error::other)?,
     );
-    let runner = ConsumerRunner::new(
+    let runner = ConsumerRunner::new_with_tunables(
         cfg.clone(),
         std::sync::Arc::new(pipeline),
         documents.clone(),
+        tunables,
     );
 
     // S11-P1-C18: registro en Consul (no bloqueante)

@@ -44,7 +44,7 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::document_store::{mongo_breaker, DocumentStore};
+use crate::document_store::{mongo_breaker_with, DocumentStore};
 
 use super::classify::{classify_redis_error, needs_reconnect, IO_CODE, STALL_CODE};
 use super::config::ConsumerConfig;
@@ -52,7 +52,7 @@ use super::dlq::{self, best_effort_item, contract_cause};
 use super::group;
 use super::pipeline::{ExtractionPipeline, ObjectSource, TextSink};
 use super::redis_conn::{self, RedisClient};
-use super::resilience::{with_retry_cb, CircuitBreaker, Failure};
+use super::resilience::{with_retry_cb_cfg, CircuitBreaker, Failure, RetryConfig, WorkerTunables};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RunnerError {
@@ -110,9 +110,10 @@ impl MasterConn {
     async fn establish(
         client: Arc<RedisClient>,
         breaker: &CircuitBreaker,
+        retry: &RetryConfig,
         read: bool,
     ) -> Result<Self, Failure> {
-        let conn = with_retry_cb(breaker, || Self::connect_once(&client, read)).await?;
+        let conn = with_retry_cb_cfg(breaker, retry, || Self::connect_once(&client, read)).await?;
         Ok(Self {
             client,
             conn: Mutex::new(conn),
@@ -191,12 +192,17 @@ impl MasterConn {
     /// reintenta la operacion una vez sobre la conexion nueva; si el
     /// reintento vuelve a fallar, el retry externo sigue con backoff. Los
     /// loops nunca crashean: es un error transitorio mas.
-    async fn run<T, F, Fut>(&self, breaker: &CircuitBreaker, op: F) -> Result<T, Failure>
+    async fn run<T, F, Fut>(
+        &self,
+        breaker: &CircuitBreaker,
+        retry: &RetryConfig,
+        op: F,
+    ) -> Result<T, Failure>
     where
         F: Fn(MultiplexedConnection) -> Fut,
         Fut: Future<Output = Result<T, Failure>>,
     {
-        with_retry_cb(breaker, || async {
+        with_retry_cb_cfg(breaker, retry, || async {
             match op(self.get()).await {
                 Err(e) if needs_reconnect(&e) => {
                     warn!(
@@ -247,6 +253,7 @@ pub struct JobContext<S: ObjectSource, K: TextSink> {
     pub documents: Arc<DocumentStore>,
     pub redis_breaker: Arc<CircuitBreaker>,
     pub mongo_breaker: Arc<CircuitBreaker>,
+    pub tunables: WorkerTunables,
 }
 
 impl<S: ObjectSource, K: TextSink> Clone for JobContext<S, K> {
@@ -257,6 +264,7 @@ impl<S: ObjectSource, K: TextSink> Clone for JobContext<S, K> {
             documents: self.documents.clone(),
             redis_breaker: self.redis_breaker.clone(),
             mongo_breaker: self.mongo_breaker.clone(),
+            tunables: self.tunables.clone(),
         }
     }
 }
@@ -288,14 +296,24 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         pipeline: Arc<ExtractionPipeline<S, K>>,
         documents: Arc<DocumentStore>,
     ) -> Self {
+        Self::new_with_tunables(cfg, pipeline, documents, WorkerTunables::new())
+    }
+
+    pub fn new_with_tunables(
+        cfg: ConsumerConfig,
+        pipeline: Arc<ExtractionPipeline<S, K>>,
+        documents: Arc<DocumentStore>,
+        tunables: WorkerTunables,
+    ) -> Self {
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency));
         Self {
             ctx: JobContext {
                 cfg,
                 pipeline,
                 documents,
-                redis_breaker: Arc::new(CircuitBreaker::default()),
-                mongo_breaker: mongo_breaker(),
+                redis_breaker: Arc::new(CircuitBreaker::with_config(tunables.breaker.clone())),
+                mongo_breaker: mongo_breaker_with(tunables.breaker.clone()),
+                tunables,
             },
             sem,
         }
@@ -331,7 +349,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // el token lo corta sin esperar al presupuesto de apagado.
         let shared = tokio::select! {
             _ = token.cancelled() => return Ok(None),
-            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, false) => r?,
+            r = MasterConn::establish(client.clone(), &ctx.redis_breaker, &ctx.tunables.retry, false) => r?,
         };
         let mut conn = shared.get();
         match tokio::select! {
@@ -366,7 +384,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // breaker abria a los ~15s y el worker moria.
         let reader_conn = tokio::select! {
             _ = token.cancelled() => return Ok(None),
-            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, true) => r?,
+            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, &ctx.tunables.retry, true) => r?,
         };
 
         // JoinSet de extracciones en vuelo; el apagado los drena con un
@@ -400,7 +418,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         // propio tick: era justamente el otro branch que cancelaba el read.
         let autoclaim_conn = tokio::select! {
             _ = token.cancelled() => return Ok(None),
-            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, false) => r?,
+            r = MasterConn::establish(boot.client.clone(), &ctx.redis_breaker, &ctx.tunables.retry, false) => r?,
         };
         let autoclaim = tokio::spawn(Self::autoclaim_loop(
             ctx.clone(),
@@ -802,23 +820,27 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) -> Result<Vec<(String, HashMap<String, String>)>, RunnerError> {
         let cfg = &ctx.cfg;
         let streams: StreamReadReply = rc
-            .run(&ctx.redis_breaker, |mut c| async move {
-                let opts = StreamReadOptions::default()
-                    .group(&cfg.group, &cfg.consumer_name)
-                    .count(cfg.count)
-                    .block(cfg.block_ms as usize);
-                let keys = vec![cfg.stream.clone()];
-                match timeout(
-                    Duration::from_millis(cfg.block_ms + 2000),
-                    c.xread_options(&keys, &[">".to_string()], &opts),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => Ok(s),
-                    Ok(Err(e)) => Err(classify_redis_error(&e)),
-                    Err(_) => Err(Failure::transient(STALL_CODE, "xreadgroup timeout")),
-                }
-            })
+            .run(
+                &ctx.redis_breaker,
+                &ctx.tunables.retry,
+                |mut c| async move {
+                    let opts = StreamReadOptions::default()
+                        .group(&cfg.group, &cfg.consumer_name)
+                        .count(cfg.count)
+                        .block(cfg.block_ms as usize);
+                    let keys = vec![cfg.stream.clone()];
+                    match timeout(
+                        Duration::from_millis(cfg.block_ms + 2000),
+                        c.xread_options(&keys, &[">".to_string()], &opts),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => Ok(s),
+                        Ok(Err(e)) => Err(classify_redis_error(&e)),
+                        Err(_) => Err(Failure::transient(STALL_CODE, "xreadgroup timeout")),
+                    }
+                },
+            )
             .await?;
 
         Ok(streams
@@ -1165,7 +1187,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let correlation_id = item.correlation_id.clone();
         let now = now_rfc3339();
         let mongo_timeout = ctx.cfg.mongo_timeout;
-        with_retry_cb(&ctx.mongo_breaker, || {
+        with_retry_cb_cfg(&ctx.mongo_breaker, ctx.tunables.retry.as_ref(), || {
             let documents = documents.clone();
             let document_id = document_id.clone();
             let correlation_id = correlation_id.clone();
@@ -1193,7 +1215,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let txt_ref = super::pipeline::txt_key(&item.document_id);
         let now = now_rfc3339();
         let mongo_timeout = ctx.cfg.mongo_timeout;
-        with_retry_cb(&ctx.mongo_breaker, || {
+        with_retry_cb_cfg(&ctx.mongo_breaker, ctx.tunables.retry.as_ref(), || {
             let documents = documents.clone();
             let document_id = document_id.clone();
             let correlation_id = correlation_id.clone();
@@ -1275,7 +1297,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
 
     async fn ack(ctx: &JobContext<S, K>, rc: &MasterConn, msg_id: &str) -> Result<(), Failure> {
         let cfg = &ctx.cfg;
-        rc.run(&ctx.redis_breaker, |mut c| {
+        rc.run(&ctx.redis_breaker, &ctx.tunables.retry, |mut c| {
             let id = msg_id.to_string();
             async move {
                 let acked: i64 = match timeout(
@@ -1308,7 +1330,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) -> Result<(), RunnerError> {
         let cfg = &ctx.cfg;
         let reply: StreamAutoClaimReply = rc
-            .run(&ctx.redis_breaker, |mut c| {
+            .run(&ctx.redis_breaker, &ctx.tunables.retry, |mut c| {
                 let start = cursor.clone();
                 async move {
                     let opts = StreamAutoClaimOptions::default().count(cfg.count);
@@ -1365,7 +1387,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         msg_id: &str,
     ) -> Result<u64, Failure> {
         let cfg = &ctx.cfg;
-        rc.run(&ctx.redis_breaker, |mut c| {
+        rc.run(&ctx.redis_breaker, &ctx.tunables.retry, |mut c| {
             let id = msg_id.to_string();
             async move {
                 match timeout(
@@ -1397,7 +1419,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
     ) -> Result<bool, RunnerError> {
         let cfg = &ctx.cfg;
         let moved = rc
-            .run(&ctx.redis_breaker, |mut c| {
+            .run(&ctx.redis_breaker, &ctx.tunables.retry, |mut c| {
                 let id = msg_id.to_string();
                 let item = item.clone();
                 let message = error_message.to_string();
@@ -1565,7 +1587,7 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
         let stream_src = ctx.cfg.stream.clone();
         let group = ctx.cfg.group.clone();
         let msg_id = msg_id.to_string();
-        rc.run(&ctx.redis_breaker, |mut c| {
+        rc.run(&ctx.redis_breaker, &ctx.tunables.retry, |mut c| {
             let stream = stream.clone();
             let stream_src = stream_src.clone();
             let group = group.clone();
@@ -1779,7 +1801,7 @@ mod tests {
             redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
         );
         let breaker = CircuitBreaker::default();
-        let rc = MasterConn::establish(client, &breaker, false)
+        let rc = MasterConn::establish(client, &breaker, &RetryConfig::default(), false)
             .await
             .unwrap_or_else(|e| panic!("establish: {e}"));
         assert_eq!(
@@ -1791,7 +1813,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let result = {
             let calls = std::sync::Arc::clone(&calls);
-            rc.run(&breaker, |_conn| {
+            rc.run(&breaker, &RetryConfig::default(), |_conn| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     if n == 0 {
@@ -1825,13 +1847,15 @@ mod tests {
             redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
         );
         let breaker = CircuitBreaker::default();
-        let rc = MasterConn::establish(client, &breaker, false)
+        let rc = MasterConn::establish(client, &breaker, &RetryConfig::default(), false)
             .await
             .unwrap_or_else(|e| panic!("establish: {e}"));
         let before = accepts.load(std::sync::atomic::Ordering::SeqCst);
 
         let result = rc
-            .run(&breaker, |_conn| async { Ok::<u8, Failure>(1) })
+            .run(&breaker, &RetryConfig::default(), |_conn| async {
+                Ok::<u8, Failure>(1)
+            })
             .await;
         assert_eq!(result.ok(), Some(1));
         assert_eq!(
@@ -1853,7 +1877,7 @@ mod tests {
             redis_conn::RedisClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}")),
         );
         let breaker = CircuitBreaker::default();
-        let rc = MasterConn::establish(client, &breaker, false)
+        let rc = MasterConn::establish(client, &breaker, &RetryConfig::default(), false)
             .await
             .unwrap_or_else(|e| panic!("establish: {e}"));
         assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1861,7 +1885,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let result = {
             let calls = std::sync::Arc::clone(&calls);
-            rc.run(&breaker, |_conn| {
+            rc.run(&breaker, &RetryConfig::default(), |_conn| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     if n == 0 {
