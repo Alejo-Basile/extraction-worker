@@ -275,6 +275,35 @@ pub struct ConsumerRunner<S: ObjectSource, K: TextSink> {
     sem: Arc<Semaphore>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkheadOutcome {
+    NoChange,
+    Increased,
+    DecreaseRequiresRestart,
+}
+
+pub fn apply_bulkhead_target(
+    sem: &Semaphore,
+    tunables: &crate::consumer::resilience::WorkerTunables,
+    target: usize,
+) -> BulkheadOutcome {
+    use std::sync::atomic::Ordering;
+    let applied = tunables.bulkhead_applied.load(Ordering::Relaxed);
+    if target == applied {
+        return BulkheadOutcome::NoChange;
+    }
+    if target > applied {
+        let delta = target - applied;
+        sem.add_permits(delta);
+        tunables.bulkhead_applied.store(target, Ordering::Relaxed);
+        tunables.bulkhead_target.store(target, Ordering::Relaxed);
+        BulkheadOutcome::Increased
+    } else {
+        tunables.bulkhead_target.store(target, Ordering::Relaxed);
+        BulkheadOutcome::DecreaseRequiresRestart
+    }
+}
+
 /// Conexiones y cliente ya resueltos antes de arrancar los loops.
 struct Bootstrap {
     client: Arc<RedisClient>,
@@ -317,6 +346,10 @@ impl<S: ObjectSource, K: TextSink> ConsumerRunner<S, K> {
             },
             sem,
         }
+    }
+
+    pub fn bulkhead(&self) -> Arc<Semaphore> {
+        self.sem.clone()
     }
 
     pub async fn run(&self, token: CancellationToken) -> Result<(), RunnerError> {
@@ -1906,5 +1939,35 @@ mod tests {
             2,
             "un socket muerto debe reemplazarse con una conexion nueva"
         );
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+    use crate::consumer::resilience::WorkerTunables;
+    use std::sync::atomic::Ordering;
+    #[test]
+    fn bulkhead_aumento_aplica_permisos() {
+        let sem = Semaphore::new(4);
+        let tun = WorkerTunables::default();
+        let o = apply_bulkhead_target(&sem, &tun, 6);
+        assert_eq!(o, BulkheadOutcome::Increased);
+        assert_eq!(sem.available_permits(), 6);
+        assert_eq!(tun.bulkhead_applied.load(Ordering::Relaxed), 6);
+    }
+    #[test]
+    fn bulkhead_reduccion_no_aplica_y_pide_reinicio() {
+        let sem = Semaphore::new(4);
+        let tun = WorkerTunables::default();
+        tun.bulkhead_applied.store(6, Ordering::Relaxed);
+        // simulate applied 6 permits
+        sem.add_permits(2);
+        let o = apply_bulkhead_target(&sem, &tun, 2);
+        assert_eq!(o, BulkheadOutcome::DecreaseRequiresRestart);
+        assert_eq!(sem.available_permits(), 6);
+        assert_eq!(tun.bulkhead_applied.load(Ordering::Relaxed), 6);
+        let o2 = apply_bulkhead_target(&sem, &tun, 6);
+        assert_eq!(o2, BulkheadOutcome::NoChange);
     }
 }

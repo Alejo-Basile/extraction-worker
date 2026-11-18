@@ -11,11 +11,13 @@
 //!   toco la red, no se reintenta y no cuenta (el breaker ya hizo su trabajo).
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
+
+use crate::consumer::min_idle::MinIdleRestartState;
 
 /// Clasificacion de un fallo en el pipeline del consumer (S2-P3-02/07).
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -246,10 +248,27 @@ impl Default for RetryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WorkerTunables {
     pub breaker: Arc<BreakerConfig>,
     pub retry: Arc<RetryConfig>,
+    pub job_timeout_ms: Arc<AtomicU64>,
+    pub max_pages: Arc<AtomicU32>,
+    pub bulkhead_target: Arc<AtomicUsize>,
+    pub bulkhead_applied: Arc<AtomicUsize>,
+}
+
+impl Default for WorkerTunables {
+    fn default() -> Self {
+        Self {
+            breaker: Arc::new(BreakerConfig::default()),
+            retry: Arc::new(RetryConfig::default()),
+            job_timeout_ms: Arc::new(AtomicU64::new(300_000)),
+            max_pages: Arc::new(AtomicU32::new(2000)),
+            bulkhead_target: Arc::new(AtomicUsize::new(4)),
+            bulkhead_applied: Arc::new(AtomicUsize::new(4)),
+        }
+    }
 }
 
 impl WorkerTunables {
@@ -259,8 +278,15 @@ impl WorkerTunables {
 }
 
 impl From<&crate::consumer::config::ConsumerConfig> for WorkerTunables {
-    fn from(_cfg: &crate::consumer::config::ConsumerConfig) -> Self {
-        Self::default()
+    fn from(cfg: &crate::consumer::config::ConsumerConfig) -> Self {
+        Self {
+            breaker: Arc::new(BreakerConfig::default()),
+            retry: Arc::new(RetryConfig::default()),
+            job_timeout_ms: Arc::new(AtomicU64::new(cfg.job_timeout.as_millis() as u64)),
+            max_pages: Arc::new(AtomicU32::new(cfg.max_pages)),
+            bulkhead_target: Arc::new(AtomicUsize::new(cfg.max_concurrency)),
+            bulkhead_applied: Arc::new(AtomicUsize::new(cfg.max_concurrency)),
+        }
     }
 }
 
@@ -572,5 +598,31 @@ mod tests {
             .build()
             .unwrap_or_else(|e| panic!("runtime de test: {e}"));
         rt.block_on(f)
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests2 {
+    use super::*;
+    use crate::consumer::config::ConsumerConfig;
+    #[test]
+    fn worker_tunables_desde_config_siembra_env() {
+        let _g = crate::consumer::config::test_env::lock();
+        let cfg = ConsumerConfig::from_env();
+        let t = WorkerTunables::from(&cfg);
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            t.job_timeout_ms.load(Ordering::Relaxed),
+            cfg.job_timeout.as_millis() as u64
+        );
+        assert_eq!(t.max_pages.load(Ordering::Relaxed), cfg.max_pages);
+        assert_eq!(
+            t.bulkhead_target.load(Ordering::Relaxed),
+            cfg.max_concurrency
+        );
+        assert_eq!(
+            t.bulkhead_applied.load(Ordering::Relaxed),
+            cfg.max_concurrency
+        );
     }
 }

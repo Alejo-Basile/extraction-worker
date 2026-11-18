@@ -245,7 +245,9 @@ fn extract_with_limit(
     ext: &PdfExtractor,
     path: &Path,
 ) -> Result<String, extraction_core::ExtractorError> {
-    let ext = std::sync::Arc::new(PdfExtractor::new(ext.max_pages));
+    let ext = std::sync::Arc::new(PdfExtractor::new(
+        ext.max_pages.load(std::sync::atomic::Ordering::Relaxed),
+    ));
     let path = path.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
