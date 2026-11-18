@@ -1017,6 +1017,7 @@ dependencies = [
  "object_store",
  "pdf-extract",
  "redis",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
