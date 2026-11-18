@@ -761,6 +761,16 @@ async fn autoclaim_agresivo_no_duplica_trabajo() {
         "la entrega duplicada no debe dejar otro .md"
     );
 
+    // El contador de completados se incrementa justo despues del cierre en
+    // Mongo: un scrape puntual puede caer en esa ventana y no ver la serie
+    // (fallo intermitente en CI). Se espera el valor exacto.
+    let completed_series = "worker_documents_total{outcome=\"completed\"}";
+    assert!(
+        wait_gauge(port, completed_series, 1.0, Duration::from_secs(15)).await,
+        "el job original debe completar una sola vez; metricas:\n{}",
+        get_metrics(port).await
+    );
+
     let metrics = get_metrics(port).await;
     assert_eq!(
         metric_value(&metrics, "worker_claim_total{result=\"claimed\"}"),
@@ -768,7 +778,7 @@ async fn autoclaim_agresivo_no_duplica_trabajo() {
         "solo el primer job debe reclamar el documento"
     );
     assert_eq!(
-        metric_value(&metrics, "worker_documents_total{outcome=\"completed\"}"),
+        metric_value(&metrics, completed_series),
         Some(1.0),
         "solo el job original debe completar"
     );
