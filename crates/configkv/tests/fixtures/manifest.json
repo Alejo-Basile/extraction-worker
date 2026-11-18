@@ -1,0 +1,112 @@
+{
+  "fixtures": [
+    {
+      "file": "doc-service.broken-coherence.json",
+      "verdict": "rejected",
+      "key": "doc_upload_grace_minutes",
+      "reason": "coherence"
+    },
+    {
+      "file": "doc-service.malformed.json",
+      "verdict": "rejected",
+      "key": null,
+      "reason": "malformed_json"
+    },
+    {
+      "file": "doc-service.out-of-range.json",
+      "verdict": "rejected",
+      "key": "max_pdf_bytes",
+      "reason": "range"
+    },
+    {
+      "file": "doc-service.unknown-key.json",
+      "verdict": "rejected",
+      "key": "shadow_ttl_minutes",
+      "reason": "unknown_key"
+    },
+    {
+      "file": "doc-service.valid.json",
+      "verdict": "accepted",
+      "key": null,
+      "reason": null
+    },
+    {
+      "file": "doc-service.wrong-type.json",
+      "verdict": "rejected",
+      "key": "reconcile_dry_run",
+      "reason": "type"
+    },
+    {
+      "file": "extraction-worker.broken-coherence.json",
+      "verdict": "rejected",
+      "key": "min_idle_ms",
+      "reason": "coherence"
+    },
+    {
+      "file": "extraction-worker.malformed.json",
+      "verdict": "rejected",
+      "key": null,
+      "reason": "malformed_json"
+    },
+    {
+      "file": "extraction-worker.out-of-range.json",
+      "verdict": "rejected",
+      "key": "bulkhead_max_concurrency",
+      "reason": "range"
+    },
+    {
+      "file": "extraction-worker.unknown-key.json",
+      "verdict": "rejected",
+      "key": "bulkhead_queue_limit",
+      "reason": "unknown_key"
+    },
+    {
+      "file": "extraction-worker.valid.json",
+      "verdict": "accepted",
+      "key": null,
+      "reason": null
+    },
+    {
+      "file": "extraction-worker.wrong-type.json",
+      "verdict": "rejected",
+      "key": "retry_multiplier",
+      "reason": "type"
+    },
+    {
+      "file": "rate-limiter.broken-coherence.json",
+      "verdict": "rejected",
+      "key": "sensitive_routes",
+      "reason": "coherence"
+    },
+    {
+      "file": "rate-limiter.malformed.json",
+      "verdict": "rejected",
+      "key": null,
+      "reason": "malformed_json"
+    },
+    {
+      "file": "rate-limiter.out-of-range.json",
+      "verdict": "rejected",
+      "key": "sensitive_routes",
+      "reason": "range"
+    },
+    {
+      "file": "rate-limiter.unknown-key.json",
+      "verdict": "rejected",
+      "key": "burst_multiplier",
+      "reason": "unknown_key"
+    },
+    {
+      "file": "rate-limiter.valid.json",
+      "verdict": "accepted",
+      "key": null,
+      "reason": null
+    },
+    {
+      "file": "rate-limiter.wrong-type.json",
+      "verdict": "rejected",
+      "key": "exempt_paths",
+      "reason": "type"
+    }
+  ]
+}
