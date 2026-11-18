@@ -1,3 +1,4 @@
+pub mod consul_reg;
 pub mod consumer;
 pub mod document_store;
 pub mod extract;
