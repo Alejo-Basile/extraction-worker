@@ -62,6 +62,10 @@ RUN apt-get update \
 COPY --from=build /src/extraction-worker /usr/local/bin/extraction-worker
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod 0555 /entrypoint.sh
+# S11-P1-C13: cache last-known-good del cliente KV. El proceso corre como
+# 10001 y el rootfs es de solo lectura, asi que el directorio debe existir en la
+# imagen con el dueño correcto para que el volumen nombrado herede ese dueño.
+RUN mkdir -p /var/lib/worker && chown 10001:10001 /var/lib/worker
 
 # SPEC 3.2 y 9: usuario no-root explicito (S1-P1-15). El worker solo escribe en
 # /tmp para el PDF descargado, asi que el contenedor puede correr con
