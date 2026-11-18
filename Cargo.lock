@@ -581,6 +581,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "configkv"
+version = "0.1.0"
+dependencies = [
+ "backoff",
+ "base64 0.23.1",
+ "metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,6 +1005,7 @@ dependencies = [
  "actix-http",
  "actix-web",
  "backoff",
+ "configkv",
  "extraction-core",
  "futures-util",
  "hostname",
@@ -999,6 +1017,7 @@ dependencies = [
  "object_store",
  "pdf-extract",
  "redis",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2778,6 +2797,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
