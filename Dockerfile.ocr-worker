@@ -8,9 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config buil
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
+# `target/` es un cache mount: NO queda en la capa del builder, por eso el
+# binario se copia a /src, que si queda y es lo que consume el `COPY --from`.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked -p ocr-worker
+    cargo build --release --locked -p ocr-worker \
+    && cp /src/target/release/ocr-worker /src/ocr-worker
 
 # --- Runtime ---
 FROM debian:trixie-slim
@@ -37,7 +40,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && groupadd --gid 10001 worker \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin worker
 
-COPY --from=builder /src/target/release/ocr-worker /usr/local/bin/ocr-worker
+COPY --from=builder /src/ocr-worker /usr/local/bin/ocr-worker
 
 EXPOSE 8080
 
