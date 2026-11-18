@@ -220,7 +220,7 @@ async fn raw_store() -> Arc<dyn object_store::ObjectStore> {
 async fn txt_store() -> Arc<dyn object_store::ObjectStore> {
     let store = AmazonS3Builder::new()
         .with_endpoint(s3_endpoint())
-        .with_bucket_name("extracted-txt")
+        .with_bucket_name("extracted-md")
         .with_access_key_id(s3_access_key())
         .with_secret_access_key(s3_secret_key())
         .with_allow_http(true)
@@ -603,10 +603,10 @@ async fn sostenimiento_1000_documentos_sin_fugas() {
         let r = raw.clone();
         let t = txt.clone();
         let raw_key = format!("raw-pdfs/{id}.pdf");
-        let txt_key = format!("{id}.md");
+        let md_key = format!("{id}.md");
         dels.spawn(async move {
             let _ = ObjectStoreExt::delete(r.as_ref(), &StorePath::from(raw_key)).await;
-            let _ = ObjectStoreExt::delete(t.as_ref(), &StorePath::from(txt_key)).await;
+            let _ = ObjectStoreExt::delete(t.as_ref(), &StorePath::from(md_key)).await;
         });
         if dels.len() >= 32 {
             if let Some(res) = dels.join_next().await {

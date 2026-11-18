@@ -156,13 +156,24 @@ async fn complete_cierra_condicional_y_es_idempotente() {
     seed(&root, &id, "QUEUED").await;
     assert!(must(store.claim(&id, &id, NOW).await));
 
-    let txt_ref = format!("{id}.md");
-    let closed = must(store.complete(&id, &txt_ref, &id, NOW).await);
+    let md_ref = format!("{id}.md");
+    let closed = must(store.complete(&id, &md_ref, &id, NOW).await);
     assert!(closed, "el cierre debe matchear PROCESSING");
 
     let after = read_document(&root, &id).await;
     assert_eq!(after.get_str("status").ok(), Some("COMPLETED"));
-    assert_eq!(after.get_str("txt_ref").ok(), Some(txt_ref.as_str()));
+    assert_eq!(after.get_str("md_ref").ok(), Some(md_ref.as_str()));
+    // El cierre ya no escribe el campo legacy, y md_ref es la clave desnuda:
+    // doc-service la usa como key dentro del bucket, un prefijo produciria
+    // extracted-md/extracted-md/<id>.md (404).
+    assert!(
+        after.get_str("txt_ref").is_err(),
+        "el cierre no debe escribir txt_ref"
+    );
+    assert!(
+        !md_ref.starts_with("extracted-md/"),
+        "md_ref debe ser la clave desnuda, sin prefijo de bucket: {md_ref}"
+    );
     assert_eq!(after.get_str("completed_at").ok(), Some(NOW));
     let history = after
         .get_array("status_history")
@@ -170,7 +181,7 @@ async fn complete_cierra_condicional_y_es_idempotente() {
     assert_eq!(history.len(), 2, "claim + complete");
 
     // Repetir el cierre: no matchea y no pisa nada (S2-P3-08).
-    let again = must(store.complete(&id, &txt_ref, &id, NOW).await);
+    let again = must(store.complete(&id, &md_ref, &id, NOW).await);
     assert!(!again, "el segundo cierre no debe matchear");
     let after = read_document(&root, &id).await;
     assert_eq!(after.get_str("status").ok(), Some("COMPLETED"));
@@ -234,7 +245,7 @@ async fn readyz_del_stack_completo_responde_ok() {
                 &extraction_worker::objects::S3Config {
                     endpoint: "http://127.0.0.1:9000".to_string(),
                     bucket_raw: "raw-pdfs".to_string(),
-                    bucket_txt: "extracted-txt".to_string(),
+                    bucket_md: "extracted-md".to_string(),
                     access_key: "worker-dev".to_string(),
                     secret_key: "worker-dev-secret".to_string(),
                 },

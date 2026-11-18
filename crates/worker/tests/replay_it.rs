@@ -54,7 +54,7 @@ fn test_cfg(stream: &str) -> ConsumerConfig {
         max_pdf_bytes: 1024 * 1024,
         s3_endpoint: "http://127.0.0.1:9000".to_string(),
         s3_bucket_raw: "raw-pdfs".to_string(),
-        s3_bucket_txt: "extracted-txt".to_string(),
+        s3_bucket_md: "extracted-md".to_string(),
         s3_access_key: "worker-dev".to_string(),
         s3_secret_key: "worker-dev-secret".to_string(),
         mongo_uri: "mongodb://127.0.0.1:27017/app".to_string(),

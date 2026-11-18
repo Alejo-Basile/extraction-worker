@@ -30,7 +30,7 @@ worker es de solo lectura.
 - **HTTP:** `/healthz`, `/readyz` y `/metrics`, expuestos por Actix-web en el
   puerto interno. No hay API pública ni CRUD; no se procesan cuerpos de request.
 - **Datos:** PDFs no confiables desde MinIO, texto extraído hacia
-  `extracted-txt`, estado en Mongo y mensajes en Redis Streams.
+  `extracted-md`, estado en Mongo y mensajes en Redis Streams.
 - **Secretos:** solo por entorno (`REDIS_URL`, `MONGO_WORKER_URI`, credenciales
   S3). El repo no contiene secretos reales; `.env.example` usa valores ficticios.
 - **Contenedor:** usuario no-root `10001:10001`, healthcheck propio y límites de

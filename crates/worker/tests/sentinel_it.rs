@@ -105,7 +105,7 @@ fn sentinel_cfg(stream: &str, group: &str, addrs: Vec<String>, master: String) -
         max_pdf_bytes: 1024 * 1024,
         s3_endpoint: "http://127.0.0.1:1".to_string(),
         s3_bucket_raw: "raw-pdfs".to_string(),
-        s3_bucket_txt: "extracted-txt".to_string(),
+        s3_bucket_md: "extracted-md".to_string(),
         s3_access_key: "it".to_string(),
         s3_secret_key: "it".to_string(),
         // Mongo muerto: el claim falla rapido y el mensaje queda pendiente
@@ -475,7 +475,7 @@ async fn readyz_sentinel_apunta_al_master_vigente_tras_failover() {
     let s3 = S3Config {
         endpoint: "http://127.0.0.1:1".to_string(),
         bucket_raw: "raw-pdfs".to_string(),
-        bucket_txt: "extracted-txt".to_string(),
+        bucket_md: "extracted-md".to_string(),
         access_key: "it".to_string(),
         secret_key: "it".to_string(),
     };

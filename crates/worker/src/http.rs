@@ -372,7 +372,7 @@ mod tests {
         let s3 = crate::objects::S3Config {
             endpoint: "http://127.0.0.1:1".to_string(),
             bucket_raw: "raw-pdfs".to_string(),
-            bucket_txt: "extracted-txt".to_string(),
+            bucket_md: "extracted-md".to_string(),
             access_key: "x".to_string(),
             secret_key: "x".to_string(),
         };

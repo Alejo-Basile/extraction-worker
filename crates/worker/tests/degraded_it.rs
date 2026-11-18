@@ -511,7 +511,7 @@ async fn raw_store() -> Arc<dyn object_store::ObjectStore> {
 async fn txt_store() -> Arc<dyn object_store::ObjectStore> {
     let store = AmazonS3Builder::new()
         .with_endpoint(s3_endpoint())
-        .with_bucket_name("extracted-txt")
+        .with_bucket_name("extracted-md")
         .with_access_key_id(s3_access_key())
         .with_secret_access_key(s3_secret_key())
         .with_allow_http(true)
@@ -519,7 +519,7 @@ async fn txt_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(must(store))
 }
 
-async fn txt_keys(id: &str) -> Vec<String> {
+async fn md_keys(id: &str) -> Vec<String> {
     let store = txt_store().await;
     // `list(Some(prefix))` agrega "/" al prefijo; como los .md no tienen
     // directorios, se lista el bucket y se filtra por el id.
@@ -771,7 +771,7 @@ async fn autoclaim_agresivo_no_duplica_trabajo() {
         "la entrega duplicada no debe agregar transiciones"
     );
     assert_eq!(
-        txt_keys(&id).await,
+        md_keys(&id).await,
         vec![format!("{id}.md")],
         "la entrega duplicada no debe dejar otro .md"
     );
