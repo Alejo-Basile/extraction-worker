@@ -104,7 +104,6 @@ pub struct ExtractionPipeline<S: ObjectSource, K: TextSink> {
     extractor: Arc<dyn TextExtractor>,
     breaker: Arc<CircuitBreaker>,
     tunables: WorkerTunables,
-    job_timeout: Duration,
     s3_op_timeout: Duration,
     max_pdf_bytes: u64,
     /// Tope del texto extraido antes del PUT (§11.5).
@@ -124,8 +123,14 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             sink,
             extractor,
             breaker,
-            tunables: WorkerTunables::new(),
-            job_timeout: limits.job_timeout,
+            tunables: {
+                let t = WorkerTunables::new();
+                t.job_timeout_ms.store(
+                    limits.job_timeout.as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                t
+            },
             s3_op_timeout: limits.s3_op_timeout,
             max_pdf_bytes: limits.max_pdf_bytes,
             max_output_bytes: limits.max_output_bytes,
@@ -170,11 +175,14 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             let key = txt_key(&item.document_id);
             self.upload(&key, &text).await
         };
-        let result = match timeout(self.job_timeout, job).await {
+        use std::sync::atomic::Ordering;
+        let job_timeout =
+            Duration::from_millis(self.tunables.job_timeout_ms.load(Ordering::Relaxed));
+        let result = match timeout(job_timeout, job).await {
             Ok(res) => res,
             Err(_) => Err(Failure::transient(
                 "JOB_TIMEOUT",
-                format!("job timeout tras {:?}", self.job_timeout),
+                format!("job timeout tras {:?}", job_timeout),
             )),
         };
         let outcome = match &result {
@@ -369,7 +377,7 @@ impl TextSink for InMemorySink {
 impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::ObjectStoreSink> {
     /// Arma el pipeline real (MinIO + pdf-extract) desde la configuracion.
     pub fn from_env(cfg: &super::config::ConsumerConfig) -> Result<Self, Failure> {
-        Self::from_env_with_tunables(cfg, WorkerTunables::new())
+        Self::from_env_with_tunables(cfg, WorkerTunables::from(cfg))
     }
 
     pub fn from_env_with_tunables(
@@ -388,7 +396,9 @@ impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::Objec
         Ok(Self::new(
             Arc::new(source),
             Arc::new(sink),
-            Arc::new(crate::extract::PdfExtractor::new(cfg.max_pages)),
+            Arc::new(crate::extract::PdfExtractor::with_live_max_pages(
+                tunables.max_pages.clone(),
+            )),
             crate::objects::minio_breaker_with(tunables.breaker.clone()),
             PipelineLimits {
                 job_timeout: cfg.job_timeout,
@@ -567,5 +577,75 @@ mod tests {
         p.process(&item)
             .await
             .unwrap_or_else(|e| panic!("con reintentos debe triunfar: {e}"));
+    }
+
+    #[tokio::test]
+    async fn tunables_se_siembran_desde_limits() {
+        let source = InMemorySource::with_file(KEY, b"%PDF-1.4 dummy".to_vec());
+        let p = pipeline(
+            source,
+            Arc::new(FakeTextExtractor::returning("x")),
+            Duration::from_millis(123),
+        );
+        use std::sync::atomic::Ordering;
+        assert_eq!(p.tunables.job_timeout_ms.load(Ordering::Relaxed), 123);
+    }
+
+    struct SlowSource {
+        started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<()>>,
+        bytes: Vec<u8>,
+    }
+    impl ObjectSource for SlowSource {
+        async fn download_to(
+            &self,
+            _key: &str,
+            _max: u64,
+            dest: &std::path::Path,
+        ) -> Result<u64, Failure> {
+            if let Some(tx) = self.started.lock().await.take() {
+                let _ = tx.send(());
+            }
+            let mut rx = self.release.lock().await;
+            let _ = (&mut *rx).await;
+            std::fs::write(dest, &self.bytes)
+                .map_err(|e| Failure::transient("TMP", e.to_string()))?;
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn job_timeout_se_captura_al_inicio_del_job() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let source = SlowSource {
+            started: tokio::sync::Mutex::new(Some(started_tx)),
+            release: tokio::sync::Mutex::new(release_rx),
+            bytes: b"%PDF-1.4 dummy".to_vec(),
+        };
+        let p = std::sync::Arc::new(ExtractionPipeline::new(
+            Arc::new(source),
+            Arc::new(InMemorySink::default()),
+            Arc::new(FakeTextExtractor::returning("hola mundo")),
+            Arc::new(CircuitBreaker::default()),
+            PipelineLimits {
+                job_timeout: Duration::from_millis(1000),
+                s3_op_timeout: Duration::from_secs(1),
+                max_pdf_bytes: 1024 * 1024,
+                max_output_bytes: 1024 * 1024,
+            },
+        ));
+        let item = work_item();
+        let p2 = p.clone();
+        let handle = tokio::spawn(async move { p2.process(&item).await });
+        let _ = started_rx.await;
+        p.tunables
+            .job_timeout_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = release_tx.send(());
+        let res = handle
+            .await
+            .unwrap_or_else(|e| panic!("join del job fallo: {e}"));
+        assert!(res.is_ok(), "debe ser Ok: {res:?}");
     }
 }

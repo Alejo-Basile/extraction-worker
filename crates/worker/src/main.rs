@@ -56,7 +56,7 @@ async fn main() -> std::io::Result<()> {
         cfg.consumer_name.clone(),
         cfg.metrics_interval,
     );
-    let tunables = extraction_worker::consumer::resilience::WorkerTunables::new();
+    let tunables = extraction_worker::consumer::resilience::WorkerTunables::from(&cfg);
     let pipeline =
         extraction_worker::consumer::pipeline::ExtractionPipeline::from_env_with_tunables(
             &cfg,
@@ -86,8 +86,9 @@ async fn main() -> std::io::Result<()> {
         cfg.clone(),
         std::sync::Arc::new(pipeline),
         documents.clone(),
-        tunables,
+        tunables.clone(),
     );
+    let bulkhead = runner.bulkhead();
 
     // S11-P1-C18: registro en Consul (no bloqueante)
     let consul_cfg = consul_reg::ConsulRegConfig::from_env();
@@ -137,6 +138,47 @@ async fn main() -> std::io::Result<()> {
     // F1: arrancar consumer con CancellationToken (S1-P3-02/03)
     let token = CancellationToken::new();
     let token_consumer = token.clone();
+    // S11-P1-C20: Consul KV watcher (no bloqueante)
+    let kv_settings = configkv::ClientSettings::from_env();
+    if !kv_settings.kv_disabled {
+        if let Ok(client) = configkv::Client::new(kv_settings.clone()) {
+            let (tx, mut rx) = tokio::sync::watch::channel(configkv::ValidatedWorkerKv::default());
+            let cache = configkv::Cache::new(kv_settings.cache_path.clone());
+            let cancel = token.clone();
+            tokio::spawn(async move {
+                configkv::Watch::new(client, cache).run(cancel, tx).await;
+            });
+            let tunables_w = tunables.clone();
+            let bulkhead_w = bulkhead.clone();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let v = rx.borrow().clone();
+                    extraction_worker::consumer::kv_overlay::WorkerKvOverlay::from_validated(&v)
+                        .apply_tunables(&tunables_w);
+                    tunables_w
+                        .job_timeout_ms
+                        .store(v.job_timeout_seconds, std::sync::atomic::Ordering::Relaxed);
+                    tunables_w
+                        .max_pages
+                        .store(v.max_pages, std::sync::atomic::Ordering::Relaxed);
+                    let outcome = extraction_worker::consumer::runner::apply_bulkhead_target(
+                        &bulkhead_w,
+                        &tunables_w,
+                        v.bulkhead_max_concurrency as usize,
+                    );
+                    if outcome == extraction_worker::consumer::runner::BulkheadOutcome::DecreaseRequiresRestart {
+                        warn!(service = telemetry::SERVICE, msg = "bulkhead_decrease_requires_restart", requested = v.bulkhead_max_concurrency, applied = tunables_w.bulkhead_applied.load(std::sync::atomic::Ordering::Relaxed));
+                        metrics::counter!("worker_bulkhead_decrease_rejected_total").increment(1);
+                    }
+                }
+            });
+        } else {
+            warn!(
+                service = telemetry::SERVICE,
+                msg = "consul kv client init failed; using env defaults"
+            );
+        }
+    }
     let consumer_handle = tokio::spawn(async move {
         if let Err(e) = runner.run(token_consumer).await {
             warn!(

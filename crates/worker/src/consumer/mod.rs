@@ -23,3 +23,4 @@ pub mod runner;
 pub use cli::{inspect_dlq as cli_inspect_dlq, inspect_pel as cli_inspect_pel};
 pub use replay::replay_dlq as cli_replay_dlq;
 pub mod kv_overlay;
+pub mod min_idle;

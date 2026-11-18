@@ -5,6 +5,8 @@
 //! descargado, nunca como buffer completo en memoria.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use extraction_core::error_code;
 use extraction_core::{ErrorKind, ExtractorError, TextExtractor};
@@ -29,17 +31,23 @@ fn pdf_error(e: pdf_extract::OutputError, path: &Path) -> ExtractorError {
 pub struct PdfExtractor {
     /// Tope de paginas por documento (defensa ante PDF hostil, §11.5).
     /// Contar paginas antes de extraer evita parsear texto de PDFs patologicos.
-    pub max_pages: u32,
+    pub max_pages: Arc<AtomicU32>,
 }
 
 impl PdfExtractor {
     pub fn new(max_pages: u32) -> Self {
+        Self {
+            max_pages: Arc::new(AtomicU32::new(max_pages)),
+        }
+    }
+    pub fn with_live_max_pages(max_pages: Arc<AtomicU32>) -> Self {
         Self { max_pages }
     }
 }
 
 impl TextExtractor for PdfExtractor {
     fn extract(&self, pdf_path: &Path) -> Result<String, ExtractorError> {
+        let max_pages = self.max_pages.load(Ordering::Relaxed);
         // Conteo previo con lopdf: un PDF de miles de paginas muere aqui y no
         // en la extraccion de texto. El parseo doble es el costo aceptado.
         let pages = lopdf::Document::load(pdf_path)
@@ -50,10 +58,10 @@ impl TextExtractor for PdfExtractor {
             })?
             .get_pages()
             .len();
-        if pages > self.max_pages as usize {
+        if pages > max_pages as usize {
             return Err(ExtractorError {
                 code: error_code::PDF_TOO_MANY_PAGES.to_string(),
-                message: format!("{pages} paginas superan el tope de {}", self.max_pages),
+                message: format!("{pages} paginas superan el tope de {max_pages}"),
                 kind: ErrorKind::Business,
             });
         }
@@ -235,5 +243,22 @@ mod tests {
             }
             Ok(_) => panic!("un archivo no-PDF debe fallar"),
         }
+    }
+
+    #[test]
+    fn max_pages_vivo_afecta_al_siguiente_job() {
+        let atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let ext = PdfExtractor::with_live_max_pages(atomic.clone());
+        let path = three_pages_fixture();
+        let res = ext.extract(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(res, Err(ref e) if e.code == extraction_core::error_code::PDF_TOO_MANY_PAGES)
+        );
+        atomic.store(3, std::sync::atomic::Ordering::Relaxed);
+        let path = three_pages_fixture();
+        let res = ext.extract(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_ok(), "debe tener exito con tope 3");
     }
 }
