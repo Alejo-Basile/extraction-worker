@@ -1,0 +1,58 @@
+# Trivy ignore file — accepted container CVE exceptions (S9-X-04).
+# Scope: the two images built by this repo (extraction-worker, ocr-worker).
+# owner=P1  review=2026-12-01  mitigation=non-root 10001:10001, read-only rootfs,
+# CapDrop=ALL, no-new-privileges, internal network only; image-upgrade backlog.
+# These CVEs come from the Debian 13.7 runtime base and its Tesseract/Poppler
+# packages, not from project code. Policy mirror: SECURITY.md > 'Gate de imágenes'.
+
+CVE-2025-69720 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-107364 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112315 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112316 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112317 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112318 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112319 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112320 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112321 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112322 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-112323 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-113351 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-115506 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-117610 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-118370 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-118380 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-119079 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-119123 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-119373 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-119374 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-119379 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-12064 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-16742 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-24882 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-36849 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-52490 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-54369 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-6653 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-71199 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-71200 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-73066 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-74860 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-76642 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-78408 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-78409 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-78410 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-8458 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86138 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86139 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86140 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86142 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86143 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-86144 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88047 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88048 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88051 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88052 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88053 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88806 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-88807 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-9538 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
