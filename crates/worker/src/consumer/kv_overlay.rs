@@ -41,9 +41,7 @@ impl WorkerKvOverlay {
         if let Some(v) = self.max_pages {
             cfg.max_pages = v;
         }
-        if let Some(v) = self.min_idle_ms {
-            cfg.min_idle_ms = v;
-        }
+        // min_idle_ms is restart-only: never applied by the overlay.
         // retry/breaker fields consumed by C19 (no fields on ConsumerConfig yet)
     }
     pub fn apply_tunables(&self, t: &crate::consumer::resilience::WorkerTunables) {
@@ -188,5 +186,41 @@ mod tests {
         assert_eq!(cfg.max_concurrency, before_mc);
         assert_eq!(cfg.job_timeout, before_jt);
         assert_eq!(cfg.min_idle_ms, before_mi);
+    }
+
+    #[test]
+    fn apply_no_aplica_min_idle_ms() {
+        let _g = LOCK.lock().unwrap();
+        let v = configkv::ValidatedWorkerKv {
+            min_idle_ms: 900_000,
+            ..configkv::ValidatedWorkerKv::default()
+        };
+        let mut cfg = ConsumerConfig::from_env();
+        let before = cfg.min_idle_ms;
+        WorkerKvOverlay::from_validated(&v).apply(&mut cfg);
+        assert_eq!(cfg.min_idle_ms, before);
+        assert_eq!(cfg.min_idle_ms, 601_000);
+    }
+
+    #[test]
+    fn job_timeout_caliente_no_recalcula_min_idle_ms() {
+        let _g = LOCK.lock().unwrap();
+        let mut cfg = ConsumerConfig::from_env();
+        let ov = WorkerKvOverlay {
+            bulkhead_max_concurrency: None,
+            retry_max_elapsed_seconds: None,
+            retry_initial_interval_ms: None,
+            retry_multiplier: None,
+            retry_max_interval_ms: None,
+            retry_randomization_factor: None,
+            breaker_failure_threshold: None,
+            breaker_timeout_seconds: None,
+            job_timeout_seconds: Some(600),
+            max_pages: None,
+            min_idle_ms: Some(900_000),
+        };
+        ov.apply(&mut cfg);
+        assert_eq!(cfg.job_timeout, std::time::Duration::from_secs(600));
+        assert_eq!(cfg.min_idle_ms, 601_000);
     }
 }

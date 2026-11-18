@@ -15,5 +15,5 @@
   "job_timeout_seconds": 300,
   "max_pages": 2000,
   "min_idle_ms": 601000,
-  "bulkhead_queue_limit": 8
+  "bulkhead_queue_limit": 10
 }

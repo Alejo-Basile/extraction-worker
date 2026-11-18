@@ -423,4 +423,12 @@ mod tests {
         );
         env::remove_var("REDIS_URL");
     }
+
+    #[test]
+    fn min_idle_desde_env_al_arrancar() {
+        let _guard = env_lock();
+        env::set_var("WORKER_MIN_IDLE_MS", "900000");
+        assert_eq!(ConsumerConfig::from_env().min_idle_ms, 900_000);
+        env::remove_var("WORKER_MIN_IDLE_MS");
+    }
 }

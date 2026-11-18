@@ -4,7 +4,7 @@
     "key": "bulkhead_max_concurrency",
     "reason": "range"
   },
-  "bulkhead_max_concurrency": 0,
+  "bulkhead_max_concurrency": 100,
   "retry_max_elapsed_seconds": 30,
   "retry_initial_interval_ms": 500,
   "retry_multiplier": 1.5,

@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+use crate::consumer::min_idle::MinIdleRestartState;
+
 /// Clasificacion de un fallo en el pipeline del consumer (S2-P3-02/07).
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -254,6 +256,7 @@ pub struct WorkerTunables {
     pub max_pages: Arc<AtomicU32>,
     pub bulkhead_target: Arc<AtomicUsize>,
     pub bulkhead_applied: Arc<AtomicUsize>,
+    pub min_idle: Arc<MinIdleRestartState>,
 }
 
 impl Default for WorkerTunables {
@@ -265,6 +268,7 @@ impl Default for WorkerTunables {
             max_pages: Arc::new(AtomicU32::new(2000)),
             bulkhead_target: Arc::new(AtomicUsize::new(4)),
             bulkhead_applied: Arc::new(AtomicUsize::new(4)),
+            min_idle: Arc::new(MinIdleRestartState::new(601_000)),
         }
     }
 }
@@ -284,6 +288,7 @@ impl From<&crate::consumer::config::ConsumerConfig> for WorkerTunables {
             max_pages: Arc::new(AtomicU32::new(cfg.max_pages)),
             bulkhead_target: Arc::new(AtomicUsize::new(cfg.max_concurrency)),
             bulkhead_applied: Arc::new(AtomicUsize::new(cfg.max_concurrency)),
+            min_idle: Arc::new(MinIdleRestartState::new(cfg.min_idle_ms)),
         }
     }
 }
@@ -622,5 +627,16 @@ mod hot_reload_tests2 {
             t.bulkhead_applied.load(Ordering::Relaxed),
             cfg.max_concurrency
         );
+    }
+
+    #[test]
+    fn tunables_min_idle_efectivo_es_el_de_arranque() {
+        let _g = crate::consumer::config::test_env::lock();
+        let cfg = crate::consumer::config::ConsumerConfig::from_env();
+        let t = WorkerTunables::from(&cfg);
+        assert_eq!(t.min_idle.effective_ms(), cfg.min_idle_ms);
+        t.min_idle.note(cfg.min_idle_ms + 1_000);
+        assert_eq!(t.min_idle.effective_ms(), cfg.min_idle_ms);
+        assert_eq!(t.min_idle.pending_ms(), Some(cfg.min_idle_ms + 1_000));
     }
 }
