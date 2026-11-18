@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_REGISTRATION_ADDR: &str = "https://consul-agent:8501";
 const DEFAULT_SERVICE_NAME: &str = "extraction-worker";
@@ -19,6 +19,7 @@ const DEFAULT_AGENT_PORT: u16 = 8501;
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INITIAL: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+const REASSERT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct ConsulRegConfig {
@@ -27,6 +28,7 @@ pub struct ConsulRegConfig {
     pub disabled: bool,
     pub ca_cert_path: Option<PathBuf>,
     pub token_path: Option<PathBuf>,
+    pub reassert_every: Duration,
 }
 
 impl ConsulRegConfig {
@@ -44,12 +46,19 @@ impl ConsulRegConfig {
             .ok()
             .or_else(|| std::env::var("CONSUL_HTTP_TOKEN_FILE").ok())
             .map(PathBuf::from);
+        let reassert_every = std::env::var("CONSUL_REASSERT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(REASSERT_INTERVAL);
         Self {
             base_url,
             service_name,
             disabled,
             ca_cert_path,
             token_path,
+            reassert_every,
         }
     }
 }
@@ -171,13 +180,6 @@ impl ConsulRegistrar {
                 resp.status()
             )));
         }
-        info!(
-            service = crate::telemetry::SERVICE,
-            msg = "registrado en consul",
-            id = %self.reg.id,
-            address = %self.reg.address,
-            port = self.reg.port
-        );
         Ok(())
     }
 
@@ -214,6 +216,12 @@ impl ConsulRegistrar {
     }
 
     pub async fn register_with_retry(&self, cancel: CancellationToken) {
+        self.register_with_retry_quiet(cancel, false).await;
+    }
+
+    /// `quiet = true` loguea el exito a nivel debug: la re-afirmacion periodica
+    /// no debe inundar los logs.
+    async fn register_with_retry_quiet(&self, cancel: CancellationToken, quiet: bool) {
         if self.cfg.disabled {
             return;
         }
@@ -223,7 +231,26 @@ impl ConsulRegistrar {
                 return;
             }
             match self.register().await {
-                Ok(()) => return,
+                Ok(()) => {
+                    if quiet {
+                        debug!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "re-registrado en consul",
+                            id = %self.reg.id,
+                            address = %self.reg.address,
+                            port = self.reg.port
+                        );
+                    } else {
+                        info!(
+                            service = crate::telemetry::SERVICE,
+                            msg = "registrado en consul",
+                            id = %self.reg.id,
+                            address = %self.reg.address,
+                            port = self.reg.port
+                        );
+                    }
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         service = crate::telemetry::SERVICE,
@@ -239,6 +266,25 @@ impl ConsulRegistrar {
                     }
                     delay = (delay * 2).min(RETRY_MAX);
                 }
+            }
+        }
+    }
+
+    pub async fn keep_registered(&self, cancel: CancellationToken) {
+        if self.cfg.disabled {
+            return;
+        }
+        let mut first = true;
+        loop {
+            self.register_with_retry_quiet(cancel.clone(), !first)
+                .await; // returns on success or cancel
+            first = false;
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(self.cfg.reassert_every) => {}
             }
         }
     }
@@ -360,6 +406,7 @@ mod tests {
             disabled: false,
             ca_cert_path: None,
             token_path: None,
+            reassert_every: REASSERT_INTERVAL,
         }
     }
 
@@ -538,6 +585,155 @@ mod tests {
     fn percent_encode_escapa_caracteres_reservados() {
         assert_eq!(percent_encode("a b/c"), "a%20b%2Fc");
         assert_eq!(percent_encode("abc-123_~."), "abc-123_~.");
+    }
+
+    /// Acepta una conexión por cada status de la lista, en orden, y guarda el body de cada request.
+    fn http_stub_seq(statuses: Vec<u16>) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            for status in statuses {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if request_complete(&buf) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push(request_body(&buf));
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    #[tokio::test]
+    async fn keep_registered_reasserts_periodically() {
+        let (url, captured) = http_stub_seq(vec![200; 4]);
+        let mut cfg = test_cfg(url.clone());
+        cfg.reassert_every = Duration::from_millis(50);
+        let r = std::sync::Arc::new(ConsulRegistrar::new(
+            cfg,
+            "replica-1".to_string(),
+            "172.24.0.5".to_string(),
+            8081,
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let r = r.clone();
+            let c = cancel.clone();
+            async move { r.keep_registered(c).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = captured.lock().map(|g| g.len()).unwrap_or(0);
+            if n >= 3 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+        let bodies = captured.lock().map(|g| g.clone()).unwrap_or_default();
+        assert!(bodies.len() >= 3, "captured {}", bodies.len());
+        for b in bodies.iter().skip(1) {
+            assert_eq!(b, &bodies[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_registered_keeps_going_after_a_failed_reassert() {
+        let (url, captured) = http_stub_seq(vec![200, 503, 200]);
+        let mut cfg = test_cfg(url.clone());
+        cfg.reassert_every = Duration::from_millis(50);
+        let r = std::sync::Arc::new(ConsulRegistrar::new(
+            cfg,
+            "replica-1".to_string(),
+            "172.24.0.5".to_string(),
+            8081,
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let r = r.clone();
+            let c = cancel.clone();
+            async move { r.keep_registered(c).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let n = captured.lock().map(|g| g.len()).unwrap_or(0);
+            if n >= 3 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let bodies = captured.lock().map(|g| g.len()).unwrap_or(0);
+        assert!(bodies >= 3, "captured {}", bodies);
+        assert!(!task.is_finished());
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    #[tokio::test]
+    async fn keep_registered_stops_on_cancel() {
+        let (url, captured) = http_stub_seq(vec![503; 3]);
+        let mut cfg = test_cfg(url.clone());
+        cfg.reassert_every = Duration::from_millis(50);
+        let r = std::sync::Arc::new(ConsulRegistrar::new(
+            cfg,
+            "replica-1".to_string(),
+            "172.24.0.5".to_string(),
+            8081,
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let r = r.clone();
+            let c = cancel.clone();
+            async move { r.keep_registered(c).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = captured.lock().map(|g| g.len()).unwrap_or(0);
+            if n >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(res.is_ok(), "task did not finish");
     }
 
     #[test]

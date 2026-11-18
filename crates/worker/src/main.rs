@@ -122,7 +122,7 @@ async fn main() -> std::io::Result<()> {
         let r = registrar.clone();
         let c = reg_cancel.clone();
         async move {
-            r.register_with_retry(c).await;
+            r.keep_registered(c).await;
         }
     });
 
