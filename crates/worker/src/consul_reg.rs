@@ -276,8 +276,7 @@ impl ConsulRegistrar {
         }
         let mut first = true;
         loop {
-            self.register_with_retry_quiet(cancel.clone(), !first)
-                .await; // returns on success or cancel
+            self.register_with_retry_quiet(cancel.clone(), !first).await; // returns on success or cancel
             first = false;
             if cancel.is_cancelled() {
                 return;
