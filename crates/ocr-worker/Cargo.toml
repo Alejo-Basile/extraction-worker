@@ -14,6 +14,9 @@ metrics.workspace = true
 metrics-exporter-prometheus = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
+hostname.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
 tracing-subscriber.workspace = true
 actix-web = { workspace = true }
 object_store = { version = "0.14.2", features = ["aws"] }
