@@ -198,3 +198,9 @@ where
 pub fn minio_breaker() -> Arc<CircuitBreaker> {
     Arc::new(CircuitBreaker::default())
 }
+
+pub fn minio_breaker_with(
+    config: std::sync::Arc<crate::consumer::resilience::BreakerConfig>,
+) -> Arc<CircuitBreaker> {
+    Arc::new(CircuitBreaker::with_config(config))
+}

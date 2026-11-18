@@ -11,7 +11,8 @@
 //!   toco la red, no se reintenta y no cuenta (el breaker ya hizo su trabajo).
 
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -62,11 +63,45 @@ enum CbState {
 
 /// Circuit Breaker (S2-P3-05): umbral por fallos consecutivos de
 /// infraestructura, `timeout` para pasar a HalfOpen y rearme con probe unico.
+/// Atomic f64 (std lacks AtomicF64). Stored as bits.
+#[derive(Debug)]
+pub struct AtomicF64 {
+    inner: AtomicU64,
+}
+
+impl AtomicF64 {
+    pub fn new(v: f64) -> Self {
+        Self {
+            inner: AtomicU64::new(v.to_bits()),
+        }
+    }
+    pub fn load(&self, o: Ordering) -> f64 {
+        f64::from_bits(self.inner.load(o))
+    }
+    pub fn store(&self, v: f64, o: Ordering) {
+        self.inner.store(v.to_bits(), o);
+    }
+}
+
+#[derive(Debug)]
+pub struct BreakerConfig {
+    pub failure_threshold: Arc<AtomicUsize>,
+    pub timeout_ms: Arc<AtomicU64>,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: Arc::new(AtomicUsize::new(5)),
+            timeout_ms: Arc::new(AtomicU64::new(30_000)),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CircuitBreaker {
     state: Mutex<CbState>,
-    failure_threshold: u32,
-    timeout: Duration,
+    config: Arc<BreakerConfig>,
 }
 
 impl Default for CircuitBreaker {
@@ -77,13 +112,27 @@ impl Default for CircuitBreaker {
 
 impl CircuitBreaker {
     pub fn new(failure_threshold: u32, timeout: Duration) -> Self {
+        let config = Arc::new(BreakerConfig {
+            failure_threshold: Arc::new(AtomicUsize::new(failure_threshold as usize)),
+            timeout_ms: Arc::new(AtomicU64::new(timeout.as_millis() as u64)),
+        });
         Self {
             state: Mutex::new(CbState::Closed { failures: 0 }),
-            failure_threshold,
-            timeout,
+            config,
         }
     }
+    pub fn with_config(config: Arc<BreakerConfig>) -> Self {
+        Self {
+            state: Mutex::new(CbState::Closed { failures: 0 }),
+            config,
+        }
+    }
+    pub fn config(&self) -> Arc<BreakerConfig> {
+        self.config.clone()
+    }
+}
 
+impl CircuitBreaker {
     pub fn allow(&self) -> bool {
         let mut st = match self.state.lock() {
             Ok(s) => s,
@@ -149,6 +198,8 @@ impl CircuitBreaker {
     }
 
     pub fn on_failure(&self) {
+        let threshold = self.config.failure_threshold.load(Ordering::Relaxed);
+        let timeout = Duration::from_millis(self.config.timeout_ms.load(Ordering::Relaxed));
         let mut st = match self.state.lock() {
             Ok(s) => s,
             Err(_) => return,
@@ -156,19 +207,17 @@ impl CircuitBreaker {
         match *st {
             CbState::Closed { failures } => {
                 let next = failures + 1;
-                if next >= self.failure_threshold {
+                if next >= threshold as u32 {
                     *st = CbState::Open {
-                        until: Instant::now() + self.timeout,
+                        until: Instant::now() + timeout,
                     };
                 } else {
                     *st = CbState::Closed { failures: next };
                 }
             }
-            // El probe fallo: se reabre y el contador arranca de cero en el
-            // proximo ciclo.
             CbState::HalfOpen { .. } => {
                 *st = CbState::Open {
-                    until: Instant::now() + self.timeout,
+                    until: Instant::now() + timeout,
                 };
             }
             CbState::Open { .. } => {}
@@ -176,17 +225,74 @@ impl CircuitBreaker {
     }
 }
 
-/// Retry envuelve al Circuit Breaker (S2-P3-04): reintenta solo fallos
-/// reintentables con backoff exponencial + jitter; el breaker decide cuando
-/// dejar de tocar la red.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_elapsed_seconds: Arc<AtomicU64>,
+    pub initial_interval_ms: Arc<AtomicU64>,
+    pub multiplier: Arc<AtomicF64>,
+    pub max_interval_ms: Arc<AtomicU64>,
+    pub randomization_factor: Arc<AtomicF64>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_elapsed_seconds: Arc::new(AtomicU64::new(30)),
+            initial_interval_ms: Arc::new(AtomicU64::new(500)),
+            multiplier: Arc::new(AtomicF64::new(1.5)),
+            max_interval_ms: Arc::new(AtomicU64::new(60_000)),
+            randomization_factor: Arc::new(AtomicF64::new(0.5)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTunables {
+    pub breaker: Arc<BreakerConfig>,
+    pub retry: Arc<RetryConfig>,
+}
+
+impl WorkerTunables {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl From<&crate::consumer::config::ConsumerConfig> for WorkerTunables {
+    fn from(_cfg: &crate::consumer::config::ConsumerConfig) -> Self {
+        Self::default()
+    }
+}
+
 pub async fn with_retry_cb<F, Fut, T>(cb: &CircuitBreaker, op: F) -> Result<T, Failure>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, Failure>>,
 {
+    with_retry_cb_cfg(cb, &RetryConfig::default(), op).await
+}
+
+pub async fn with_retry_cb_cfg<F, Fut, T>(
+    cb: &CircuitBreaker,
+    cfg: &RetryConfig,
+    op: F,
+) -> Result<T, Failure>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, Failure>>,
+{
     use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
+    let max_elapsed = Duration::from_secs(cfg.max_elapsed_seconds.load(Ordering::Relaxed));
     let mut bo = ExponentialBackoffBuilder::new()
-        .with_max_elapsed_time(Some(Duration::from_secs(30)))
+        .with_initial_interval(Duration::from_millis(
+            cfg.initial_interval_ms.load(Ordering::Relaxed),
+        ))
+        .with_multiplier(cfg.multiplier.load(Ordering::Relaxed))
+        .with_max_interval(Duration::from_millis(
+            cfg.max_interval_ms.load(Ordering::Relaxed),
+        ))
+        .with_randomization_factor(cfg.randomization_factor.load(Ordering::Relaxed))
+        .with_max_elapsed_time(Some(max_elapsed))
         .build();
     loop {
         if !cb.allow() {
@@ -403,6 +509,59 @@ mod tests {
         );
         cb.on_failure();
         assert!(!cb.allow(), "los fatales cuentan para el umbral");
+    }
+
+    #[test]
+    fn breaker_umbral_cambiado_en_caliente_no_cierra_open() {
+        let cfg = Arc::new(BreakerConfig {
+            failure_threshold: Arc::new(AtomicUsize::new(2)),
+            timeout_ms: Arc::new(AtomicU64::new(50)),
+        });
+        let cb = CircuitBreaker::with_config(cfg.clone());
+        cb.on_failure();
+        cb.on_failure();
+        assert!(cb.is_open(), "debe abrir con 2 fallos");
+        cfg.failure_threshold
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        assert!(cb.is_open(), "sigue abierto tras cambiar umbral");
+    }
+
+    #[test]
+    fn breaker_umbral_compartido_afecta_instancias_existentes() {
+        let cfg = Arc::new(BreakerConfig {
+            failure_threshold: Arc::new(AtomicUsize::new(2)),
+            timeout_ms: Arc::new(AtomicU64::new(50)),
+        });
+        let cb1 = CircuitBreaker::with_config(cfg.clone());
+        cb1.on_failure();
+        cb1.on_failure();
+        assert!(cb1.is_open());
+        cfg.failure_threshold
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        let cb2 = CircuitBreaker::with_config(cfg.clone());
+        for _ in 0..99 {
+            cb2.on_failure();
+            if cb2.is_open() {
+                break;
+            }
+        }
+        assert!(!cb2.is_open(), "nuevo breaker necesita 100 fallos");
+    }
+
+    #[test]
+    fn retry_params_vivos_respetan_max_elapsed() {
+        let cfg = RetryConfig {
+            max_elapsed_seconds: Arc::new(AtomicU64::new(1)),
+            initial_interval_ms: Arc::new(AtomicU64::new(10)),
+            multiplier: Arc::new(AtomicF64::new(1.0)),
+            max_interval_ms: Arc::new(AtomicU64::new(10)),
+            randomization_factor: Arc::new(AtomicF64::new(0.0)),
+        };
+        let cb = CircuitBreaker::default();
+        let start = std::time::Instant::now();
+        let op = || async { Err::<u8, Failure>(Failure::transient("X", "y")) };
+        let _ = futures_block(with_retry_cb_cfg(&cb, &cfg, op));
+        assert!(start.elapsed().as_secs_f64() < 1.5, "debe terminar rapido");
     }
 
     /// Puente minimo para correr futures de tokio en tests sin depender del

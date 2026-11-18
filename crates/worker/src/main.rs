@@ -7,6 +7,7 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use actix_web::{middleware, App, HttpServer};
+use extraction_worker::consul_reg;
 use extraction_worker::consumer;
 use extraction_worker::http;
 use extraction_worker::telemetry;
@@ -55,7 +56,12 @@ async fn main() -> std::io::Result<()> {
         cfg.consumer_name.clone(),
         cfg.metrics_interval,
     );
-    let pipeline = extraction_worker::consumer::pipeline::ExtractionPipeline::from_env(&cfg)
+    let tunables = extraction_worker::consumer::resilience::WorkerTunables::new();
+    let pipeline =
+        extraction_worker::consumer::pipeline::ExtractionPipeline::from_env_with_tunables(
+            &cfg,
+            tunables.clone(),
+        )
         .map_err(|e| std::io::Error::other(format!("configuracion S3 invalida: {e}")))?;
     // F3b: cliente Mongo con rol acotado (ADR-0006); sin MONGO_WORKER_URI
     // valido el worker no arranca.
@@ -76,7 +82,31 @@ async fn main() -> std::io::Result<()> {
     let readiness = std::sync::Arc::new(
         http::Readiness::new(&cfg, minio, documents.clone()).map_err(std::io::Error::other)?,
     );
-    let runner = ConsumerRunner::new(cfg, std::sync::Arc::new(pipeline), documents);
+    let runner = ConsumerRunner::new_with_tunables(
+        cfg.clone(),
+        std::sync::Arc::new(pipeline),
+        documents.clone(),
+        tunables,
+    );
+
+    // S11-P1-C18: registro en Consul (no bloqueante)
+    let consul_cfg = consul_reg::ConsulRegConfig::from_env();
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "localhost".to_string());
+    let address = consul_reg::resolve_address(&consul_cfg.base_url);
+    let registrar = std::sync::Arc::new(consul_reg::ConsulRegistrar::new(
+        consul_cfg, hostname, address, port,
+    ));
+    let reg_cancel = CancellationToken::new();
+    let mut reg_task = tokio::spawn({
+        let r = registrar.clone();
+        let c = reg_cancel.clone();
+        async move {
+            r.register_with_retry(c).await;
+        }
+    });
 
     let prometheus = telemetry::prometheus_handle()
         .map_err(|e| std::io::Error::other(format!("no se pudo instalar el recorder: {e}")))?;
@@ -128,6 +158,29 @@ async fn main() -> std::io::Result<()> {
 
     wait_for_shutdown_signal().await;
     let started = Instant::now();
+    // Cancelar loop de registro primero. Se acota la espera: un request de
+    // registro en vuelo tiene timeout de 5 s y no debe consumir el presupuesto
+    // de apagado; si no termina, se aborta (el desregistro limpia igual).
+    reg_cancel.cancel();
+    if tokio::time::timeout(Duration::from_millis(300), &mut reg_task)
+        .await
+        .is_err()
+    {
+        reg_task.abort();
+    }
+    // Desregistro con presupuesto de 2 s, antes de drenar HTTP y consumer.
+    match tokio::time::timeout(Duration::from_secs(2), registrar.deregister()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            service = telemetry::SERVICE,
+            msg = "desregistro de consul fallido; el catalogo se limpia por el check",
+            error = %e
+        ),
+        Err(_) => warn!(
+            service = telemetry::SERVICE,
+            msg = "desregistro de consul agoto el presupuesto de 2 s; el catalogo se limpia por el check"
+        ),
+    }
     info!(
         service = telemetry::SERVICE,
         msg = "apagado solicitado; drenando HTTP y consumer"
@@ -135,7 +188,9 @@ async fn main() -> std::io::Result<()> {
     // Cancelar consumer primero: el BLOCK de XREADGROUP se corta por token.
     token.cancel();
     let abort_consumer = consumer_handle.abort_handle();
-    let budget = Duration::from_secs(SHUTDOWN_GRACE_SECS);
+    let elapsed_so_far = started.elapsed();
+    let remaining = Duration::from_secs(SHUTDOWN_GRACE_SECS).saturating_sub(elapsed_so_far);
+    let budget = remaining;
     // Deadline unico: HTTP y consumer drenan en paralelo, no en serie.
     let drain = async {
         let _ = tokio::join!(handle.stop(true), consumer_handle);

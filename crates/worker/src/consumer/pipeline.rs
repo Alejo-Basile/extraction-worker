@@ -20,7 +20,7 @@ use extraction_core::TextExtractor;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::consumer::resilience::{with_retry_cb, CircuitBreaker, Failure};
+use crate::consumer::resilience::{with_retry_cb_cfg, CircuitBreaker, Failure, WorkerTunables};
 use crate::objects::with_s3_timeout;
 
 /// Puerto de descarga del PDF original. `dest` es un archivo temporal que el
@@ -103,6 +103,7 @@ pub struct ExtractionPipeline<S: ObjectSource, K: TextSink> {
     sink: Arc<K>,
     extractor: Arc<dyn TextExtractor>,
     breaker: Arc<CircuitBreaker>,
+    tunables: WorkerTunables,
     job_timeout: Duration,
     s3_op_timeout: Duration,
     max_pdf_bytes: u64,
@@ -123,11 +124,17 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
             sink,
             extractor,
             breaker,
+            tunables: WorkerTunables::new(),
             job_timeout: limits.job_timeout,
             s3_op_timeout: limits.s3_op_timeout,
             max_pdf_bytes: limits.max_pdf_bytes,
             max_output_bytes: limits.max_output_bytes,
         }
+    }
+
+    pub fn with_tunables(mut self, tunables: WorkerTunables) -> Self {
+        self.tunables = tunables;
+        self
     }
     /// Breaker de MinIO, expuesto para el gauge `worker_breaker_open`.
     pub fn breaker(&self) -> Arc<CircuitBreaker> {
@@ -207,7 +214,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         let max = self.max_pdf_bytes;
         let key = key.to_string();
         let op_timeout = self.s3_op_timeout;
-        let result = with_retry_cb(&self.breaker, || {
+        let result = with_retry_cb_cfg(&self.breaker, self.tunables.retry.as_ref(), || {
             let source = source.clone();
             let key = key.clone();
             let dest = dest.clone();
@@ -244,7 +251,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         let key = key.to_string();
         let text = text.to_string();
         let op_timeout = self.s3_op_timeout;
-        let result = with_retry_cb(&self.breaker, || {
+        let result = with_retry_cb_cfg(&self.breaker, self.tunables.retry.as_ref(), || {
             let sink = sink.clone();
             let key = key.clone();
             let text = text.clone();
@@ -271,7 +278,7 @@ impl<S: ObjectSource, K: TextSink> ExtractionPipeline<S, K> {
         let sink = self.sink.clone();
         let key = txt_key(&item.document_id);
         let op_timeout = self.s3_op_timeout;
-        let result = with_retry_cb(&self.breaker, || {
+        let result = with_retry_cb_cfg(&self.breaker, self.tunables.retry.as_ref(), || {
             let sink = sink.clone();
             let key = key.clone();
             async move { with_s3_timeout(op_timeout, || async { sink.delete(&key).await }).await }
@@ -362,6 +369,13 @@ impl TextSink for InMemorySink {
 impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::ObjectStoreSink> {
     /// Arma el pipeline real (MinIO + pdf-extract) desde la configuracion.
     pub fn from_env(cfg: &super::config::ConsumerConfig) -> Result<Self, Failure> {
+        Self::from_env_with_tunables(cfg, WorkerTunables::new())
+    }
+
+    pub fn from_env_with_tunables(
+        cfg: &super::config::ConsumerConfig,
+        tunables: WorkerTunables,
+    ) -> Result<Self, Failure> {
         let s3 = crate::objects::S3Config {
             endpoint: cfg.s3_endpoint.clone(),
             bucket_raw: cfg.s3_bucket_raw.clone(),
@@ -375,14 +389,15 @@ impl ExtractionPipeline<crate::objects::ObjectStoreSource, crate::objects::Objec
             Arc::new(source),
             Arc::new(sink),
             Arc::new(crate::extract::PdfExtractor::new(cfg.max_pages)),
-            crate::objects::minio_breaker(),
+            crate::objects::minio_breaker_with(tunables.breaker.clone()),
             PipelineLimits {
                 job_timeout: cfg.job_timeout,
                 s3_op_timeout: cfg.s3_op_timeout,
                 max_pdf_bytes: cfg.max_pdf_bytes,
                 max_output_bytes: cfg.max_output_bytes,
             },
-        ))
+        )
+        .with_tunables(tunables))
     }
 }
 
