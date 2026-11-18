@@ -51,6 +51,16 @@ async fn main() -> std::io::Result<()> {
 
     // F3: pipeline real (GET raw-pdfs -> pdf-extract -> PUT extracted-txt/*.md)
     let cfg = ConsumerConfig::from_env();
+    if extraction_worker::consumer::min_idle::coherence_violation(cfg.min_idle_ms, cfg.job_timeout)
+    {
+        warn!(
+            service = telemetry::SERVICE,
+            msg = "min_idle_below_2x_job_timeout",
+            min_idle_ms = cfg.min_idle_ms,
+            job_timeout_ms = cfg.job_timeout.as_millis() as u64
+        );
+        metrics::counter!("worker_min_idle_below_2x_job_timeout_total").increment(1);
+    }
     let startup = (
         cfg.stream.clone(),
         cfg.consumer_name.clone(),
@@ -161,6 +171,18 @@ async fn main() -> std::io::Result<()> {
                     tunables_w
                         .max_pages
                         .store(v.max_pages, std::sync::atomic::Ordering::Relaxed);
+                    let mi_outcome = tunables_w.min_idle.note(v.min_idle_ms);
+                    if let extraction_worker::consumer::min_idle::MinIdleOutcome::LoggedRequiresRestart = mi_outcome {
+                         warn!(service = telemetry::SERVICE, msg = extraction_worker::consumer::min_idle::LOG_MSG, requested_ms = v.min_idle_ms, effective_ms = tunables_w.min_idle.effective_ms());
+                         metrics::counter!("worker_min_idle_change_requires_restart_total").increment(1);
+                     }
+                    metrics::gauge!("worker_min_idle_pending_ms").set(
+                        tunables_w
+                            .min_idle
+                            .pending_ms()
+                            .map(|x| x as f64)
+                            .unwrap_or(0.0),
+                    );
                     let outcome = extraction_worker::consumer::runner::apply_bulkhead_target(
                         &bulkhead_w,
                         &tunables_w,
