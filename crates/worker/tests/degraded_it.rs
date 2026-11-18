@@ -646,7 +646,22 @@ async fn caida_de_minio_no_quema_mensajes_y_recupera_sin_dlq() {
     );
 
     // En Mongo: los K siguen QUEUED (el reader esta pausado) y nada completo.
-    assert_eq!(count_status(&root, &k_ids, "QUEUED").await, 6);
+    // Un read en vuelo (COUNT=1, BLOCK=5s) puede reclamar a lo sumo un K antes
+    // de que el reader vuelva a evaluar el gate degradado: ese K queda en
+    // PROCESSING/RETRYING y el resto en QUEUED. Exigir 6 QUEUED hacia flaky el
+    // assert contra el propio modelo del test (ver `max_pending` arriba).
+    let k_queued = count_status(&root, &k_ids, "QUEUED").await;
+    let k_inflight = count_status(&root, &k_ids, "PROCESSING").await
+        + count_status(&root, &k_ids, "RETRYING").await;
+    assert!(
+        k_queued >= k_ids.len() as u64 - 1,
+        "solo un read en vuelo puede reclamar un K; QUEUED={k_queued} in-flight={k_inflight}"
+    );
+    assert_eq!(
+        k_queued + k_inflight,
+        k_ids.len() as u64,
+        "todo K debe quedar QUEUED o en vuelo durante la caida; ninguno terminal"
+    );
     let completed = count_status(&root, &all_ids, "COMPLETED").await;
     assert_eq!(completed, 6, "nada debe completar durante la caida");
     let stuck_status = doc_status(&root, &stuck).await;
