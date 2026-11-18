@@ -14,6 +14,13 @@
 # Solo se publica linux/amd64. La infraestructura corre en amd64 y no necesita
 # arm64; publicar esa arquitectura duplicaba el tiempo de build y agregaba
 # fallas en el runner ARM.
+#
+# S11-P1-C27: la matriz publica DOS imagenes (extraction-worker y ocr-worker)
+# con una sola definicion de job. Cada imagen obtiene su propio digest inmutable
+# (tag por SHA corto) y su propio cache de build, de modo que una falla en
+# una imagen no cancela la otra (fail-fast: false). Los digests se fijan por
+# operador en infra/compose/docker-compose.yml a partir de la salida de este
+# workflow.
 name: publish-image
 
 on:  # yamllint disable-line rule:truthy
@@ -33,8 +40,18 @@ concurrency:
 
 jobs:
   build:
-    name: build (linux/amd64)
+    name: build ${{ matrix.image }} (linux/amd64)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: extraction-worker
+            dockerfile: Dockerfile
+            description: Worker de extraccion de PDFs
+          - image: ocr-worker
+            dockerfile: Dockerfile.ocr-worker
+            description: Worker de OCR de PDFs
     steps:
       - uses: actions/checkout@v4
 
@@ -55,15 +72,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/alejo-basile/extraction-worker
+          images: ghcr.io/alejo-basile/${{ matrix.image }}
           tags: |
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
           labels: |
-            org.opencontainers.image.title=extraction-worker
-            org.opencontainers.image.description=Worker de extraccion de PDFs
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.description=${{ matrix.description }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
@@ -72,13 +89,14 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
+          cache-from: type=gha,scope=${{ matrix.image }}-amd64
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-amd64
 
       # El digest queda en el resumen del job para que un operador lo fije.
       - name: print image digest
@@ -89,6 +107,6 @@ jobs:
             echo "## Imagen publicada"
             echo ""
             echo '```'
-            echo "ghcr.io/alejo-basile/extraction-worker@${IMAGE_DIGEST}"
+            echo "ghcr.io/alejo-basile/${{ matrix.image }}@${IMAGE_DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
