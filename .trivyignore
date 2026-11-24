@@ -56,3 +56,5 @@ CVE-2026-88053 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-i
 CVE-2026-88806 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
 CVE-2026-88807 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
 CVE-2026-9538 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-124709 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
+CVE-2026-107494 # owner=P1 review=2026-12-01 mitigation=accepted-exception base-image-backlog
