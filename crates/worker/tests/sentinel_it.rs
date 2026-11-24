@@ -173,24 +173,28 @@ async fn wait_new_master(
     budget: Duration,
 ) -> MultiplexedConnection {
     let deadline = Instant::now() + budget;
+    let mut last;
     loop {
         match rc.reset_async().await {
-            Ok(()) => {
-                if let Ok(mut conn) = rc.connect().await {
+            Ok(()) => match rc.connect().await {
+                Ok(mut conn) => {
                     let run = run_id_of(&mut conn).await;
                     let role = role_of(&mut conn).await;
                     if !run.is_empty() && run != initial_run_id && role == "master" {
                         return conn;
                     }
+                    last = format!("role={role} run_id={run}");
                 }
-            }
+                Err(e) => last = format!("connect: {e}"),
+            },
             Err(e) => {
                 eprintln!("reset para re-resolver el master: {e}");
+                last = format!("reset: {e}");
             }
         }
         assert!(
             Instant::now() < deadline,
-            "el master nuevo no convergio en {budget:?}"
+            "el master nuevo no convergio en {budget:?} (ultimo estado: {last})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -216,6 +220,113 @@ async fn master_addr_of(master_name: &str, sentinel_addr: &str) -> (String, u16)
         .and_then(|port| port.parse().ok())
         .unwrap_or(6379);
     (host, port)
+}
+
+/// Convierte la lista plana campo/valor de una entrada de `SENTINEL` en un
+/// mapa. Los valores no textuales (enteros) se stringifican; el test solo
+/// usa campos textuales.
+fn sentinel_fields(items: &[redis::Value]) -> HashMap<String, String> {
+    fn text(value: &redis::Value) -> Option<String> {
+        match value {
+            redis::Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+            redis::Value::SimpleString(text) => Some(text.clone()),
+            redis::Value::Int(number) => Some(number.to_string()),
+            _ => None,
+        }
+    }
+
+    items
+        .chunks_exact(2)
+        .filter_map(|pair| Some((text(&pair[0])?, text(&pair[1])?)))
+        .collect()
+}
+
+/// `SENTINEL replicas <name>`: una entrada por replica, como mapa de campos.
+/// Con una sola replica RESP2 devuelve el array plano; con varias, un array
+/// de arrays.
+async fn sentinel_replicas(master_name: &str, sentinel_addr: &str) -> Vec<HashMap<String, String>> {
+    let client = must(redis::Client::open(
+        format!("redis://{sentinel_addr}/").as_str(),
+    ));
+    let mut conn = must(client.get_multiplexed_async_connection().await);
+    let reply: redis::Value = must(
+        redis::cmd("SENTINEL")
+            .arg("replicas")
+            .arg(master_name)
+            .query_async(&mut conn)
+            .await,
+    );
+    match reply {
+        redis::Value::Array(items) => {
+            if items.is_empty() {
+                Vec::new()
+            } else if items
+                .iter()
+                .all(|item| !matches!(item, redis::Value::Array(_)))
+            {
+                vec![sentinel_fields(&items)]
+            } else {
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        redis::Value::Array(fields) => Some(sentinel_fields(fields)),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Espera a que los sentinels tengan una vista estable antes de pedir un
+/// failover manual: todos reportan el mismo master y cada replica ya fue
+/// observada como `slave` con el link de replicacion sano.
+///
+/// Sentinel refresca INFO cada 10s. Tras un failover, el master viejo queda
+/// como replica, pero otro sentinel puede conservar `role-reported=master`
+/// con timestamp viejo si su proximo INFO cae despues de la siguiente
+/// promocion. Al promoverlo, ese sentinel lo vuelve a degradar
+/// (`+convert-to-slave`) dentro de la ventana de promocion y el failover
+/// manual aborta por timeout sin reintentar. Con la vista ya convergida, el
+/// cambio de rol es fresco y Sentinel espera `publish-period*4` antes de
+/// corregirlo, de sobra para que el lider confirme la promocion.
+async fn wait_sentinel_converged(master_name: &str, addrs: &[String], budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        let mut masters = std::collections::HashSet::new();
+        let mut converged = true;
+        for addr in addrs {
+            masters.insert(master_addr_of(master_name, addr).await);
+            let replicas = sentinel_replicas(master_name, addr).await;
+            if replicas.is_empty() {
+                converged = false;
+                continue;
+            }
+            for fields in &replicas {
+                let flags = fields.get("flags").map(String::as_str).unwrap_or("");
+                let role = fields.get("role-reported").map(String::as_str);
+                let link = fields.get("master-link-status").map(String::as_str);
+                if role != Some("slave")
+                    || link != Some("ok")
+                    || flags.contains("s_down")
+                    || flags.contains("o_down")
+                    || flags.contains("disconnected")
+                {
+                    converged = false;
+                }
+            }
+        }
+        if converged && masters.len() == 1 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "los sentinels no convergieron a una vista estable en {budget:?} \
+             (master unico y replica observada como slave con link ok)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Espera a que la instancia en `url` reporte `expected` en `ROLE`.
@@ -373,6 +484,9 @@ async fn failover_sentinel_reconecta_y_sigue_consumiendo() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // --- 2) Failover y re-resolucion ---
+    // Vista convergida antes del failover manual: evita que otro Sentinel
+    // revierta la promocion con un `role-reported=master` obsoleto.
+    wait_sentinel_converged(&master_name, &addrs, Duration::from_secs(60)).await;
     trigger_failover(&master_name, &addrs[0]).await;
     let mut conn_new = wait_new_master(&rc, &run0, Duration::from_secs(60)).await;
     assert_eq!(
@@ -499,6 +613,9 @@ async fn readyz_sentinel_apunta_al_master_vigente_tras_failover() {
     );
 
     // --- 3) Failover y convergencia al master nuevo ---
+    // Vista convergida antes del failover manual: los sentinels ya deben
+    // observar como `slave` al nodo que se va a promover.
+    wait_sentinel_converged(&master_name, &addrs, Duration::from_secs(60)).await;
     trigger_failover(&master_name, &addrs[0]).await;
     let mut conn_new = wait_new_master(&rc, &run0, Duration::from_secs(60)).await;
     assert_eq!(
