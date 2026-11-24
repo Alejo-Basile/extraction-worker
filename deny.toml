@@ -32,4 +32,8 @@ ignore = [
     # chrono/humantime unmaintained, sin alternativa inmediata en deps transitivas
     "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0542",
+    # cookie 0.16.2 via actix-web 4.20.0: nonces de cookies privadas pueden repetirse
+    # en procesos que hacen fork. Los workers no forkean y no emiten cookies privadas.
+    # Se retira al actualizar actix-web a una version que use cookie >= 0.18.3.
+    "RUSTSEC-2026-0594",
 ]
