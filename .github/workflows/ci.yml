@@ -40,15 +40,18 @@ jobs:
 
       # CI falla ante dependencias con vulnerabilidad conocida. La lista de
       # ignores sale de deny.toml para no duplicarla con cargo-deny.
+      # Las herramientas se instalan con version exacta: rust-toolchain.toml
+      # fija rustc 1.90.0 y una release nueva de la herramienta (p. ej.
+      # cargo-deny 0.22.1 pide rustc 1.95.0) rompe el job sin que cambie el repo.
       - name: cargo audit
         run: |
-          cargo install --locked --force cargo-audit
+          cargo install --locked --force cargo-audit --version =0.23.0
           ./scripts/security-audit.sh
 
       # Licencias y duplicados de dependencias
       - name: cargo deny
         run: |
-          cargo install --locked --force cargo-deny
+          cargo install --locked --force cargo-deny --version =0.21.0
           cargo deny check bans licenses advisories
 
   integration:
